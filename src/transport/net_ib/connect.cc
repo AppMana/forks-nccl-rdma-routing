@@ -8,6 +8,7 @@
 #include "connect.h"
 #include "common.h"
 #include "p2p_resiliency.h"
+#include "subnet_match.h"  // getGidAddrFamily + gidSameSubnet (single definition; unit-tested)
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
@@ -160,13 +161,7 @@ static void* envIbAddrRange(sa_family_t af, int* mask) {
   return ret;
 }
 
-static sa_family_t getGidAddrFamily(union ibv_gid* gid) {
-  const struct in6_addr* a = (struct in6_addr*)gid->raw;
-  bool isIpV4Mapped = ((a->s6_addr32[0] | a->s6_addr32[1]) | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL;
-  bool isIpV4MappedMulticast =
-    (a->s6_addr32[0] == htonl(0xff0e0000) && ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
-  return (isIpV4Mapped || isIpV4MappedMulticast) ? AF_INET : AF_INET6;
-}
+// getGidAddrFamily moved to subnet_match.h (single definition, unit-tested).
 
 static bool matchGidAddrPrefix(sa_family_t af, void* prefix, int prefixlen, union ibv_gid* gid) {
   struct in_addr* base = NULL;
@@ -486,26 +481,8 @@ ncclResult_t ncclIbQpError(struct ncclIbQp* qp) {
   return ncclSuccess;
 }
 
-// Check if two RoCE GIDs are on the same subnet.
-// For IPv4-mapped GIDs (::ffff:a.b.c.d), uses the given prefix length (1..32).
-// For native IPv6 GIDs, compares the 64-bit subnet prefix.
-static bool gidSameSubnet(union ibv_gid* local, union ibv_gid* remote, int prefixLen) {
-  sa_family_t localFam = getGidAddrFamily(local);
-  sa_family_t remoteFam = getGidAddrFamily(remote);
-  if (localFam != remoteFam) return false;
-  if (localFam == AF_INET) {
-    // IPv4-mapped: compare using configured prefix length.
-    // IPv4 address is in bytes 12-15 of the raw GID.
-    uint32_t localIp, remoteIp;
-    memcpy(&localIp, local->raw + 12, 4);
-    memcpy(&remoteIp, remote->raw + 12, 4);
-    uint32_t mask = htonl(~((1U << (32 - prefixLen)) - 1));
-    return (localIp & mask) == (remoteIp & mask);
-  } else {
-    // IPv6: compare subnet prefix (first 64 bits)
-    return local->global.subnet_prefix == remote->global.subnet_prefix;
-  }
-}
+// gidSameSubnet moved to subnet_match.h (single definition, unit-tested for the
+// per-link IPv6 /64 case in rdma-routing/tests/subnet_match_test.cc).
 
 // check if a local GID matches ANY of the remote GIDs.
 static bool subnetMatchesAny(union ibv_gid* localGid, union ibv_gid* remoteGids, int nRemoteGids, int prefixLen) {
