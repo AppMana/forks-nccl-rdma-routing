@@ -53,6 +53,55 @@ TEST(Subnet, MidChainRailsReachOnlyTheirOwnNeighbour) {
   EXPECT_FALSE(gidSameSubnet(&railDown, &peerUp,   64));
 }
 
+// --- NCCL_IB_SUBNET_PREFER_HCA: prefer the rail over the reaches-all fallback ---
+// The flat fallback (rxe_lan) reaches every peer, so without a preference an
+// adjacent peer wrongly stays on it. The prefer-list picks the rail when it
+// reaches, and only falls back when no rail does.
+TEST(PreferHca, AdjacentPicksRailOverFallback) {
+  const char* names[] = {"usb4_rdma5", "usb4_rdma15", "rxe_lan"};
+  int reach[] = {1, 0, 1};  // my rail-to-this-peer reaches; other rail doesn't; rxe reaches (flat)
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, "usb4_rdma"), 0);  // pick the rail, not rxe
+}
+TEST(PreferHca, NonAdjacentFallsThroughToCaller) {
+  const char* names[] = {"usb4_rdma5", "usb4_rdma15", "rxe_lan"};
+  int reach[] = {0, 0, 1};  // no rail reaches; only the flat fallback
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, "usb4_rdma"), -1);  // no preferred match -> caller's fallback
+}
+TEST(PreferHca, SecondPriorityWhenFirstUnreachable) {
+  const char* names[] = {"usb4_rdma5", "usb4_rdma15", "rxe_lan"};
+  int reach[] = {0, 0, 1};
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, "usb4_rdma,rxe_lan"), 2);  // rxe is 2nd in the list
+}
+TEST(PreferHca, EmptyOrNullListNoPreference) {
+  const char* names[] = {"usb4_rdma5", "rxe_lan"};
+  int reach[] = {1, 1};
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 2, ""), -1);
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 2, nullptr), -1);
+}
+TEST(PreferHca, FirstReachableOfHighestPriorityPrefix) {
+  const char* names[] = {"rxe_lan", "usb4_rdma5", "usb4_rdma15"};  // fallback listed first by index
+  int reach[] = {1, 0, 1};  // rxe reaches; rail15 reaches
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, "usb4_rdma,rxe_lan"), 2);  // rail beats rxe despite index order
+}
+
+// The exact config syntax: usb4_rdma\d*,rxe_lan\d* (raw string => the literal
+// backslash reaches the matcher, which translates \d -> [0-9]).
+TEST(PreferHca, RegexDigitSyntaxFromConfig) {
+  const char* names[] = {"usb4_rdma5", "usb4_rdma15", "rxe_lan"};
+  int reach[] = {1, 0, 1};
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, R"(usb4_rdma\d*,rxe_lan\d*)"), 0);
+}
+TEST(PreferHca, RegexDigitNonAdjacentTakesFallback) {
+  const char* names[] = {"usb4_rdma5", "usb4_rdma15", "rxe_lan"};
+  int reach[] = {0, 0, 1};
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 3, R"(usb4_rdma\d*,rxe_lan\d*)"), 2);  // rxe (2nd pattern)
+}
+TEST(PreferHca, DevPathPrefixStripped) {
+  const char* names[] = {"usb4_rdma5", "rxe_lan"};
+  int reach[] = {1, 1};
+  EXPECT_EQ(ibPreferReachableDev(names, reach, 2, R"(/dev/usb4_rdma\d*)"), 0);
+}
+
 // Two links that share the first 32 bits but differ in bits 33-64 must STILL be
 // different subnets -- i.e. the IPv6 path compares the full /64, not an IPv4
 // /<=32 prefix. (Our FNV-hash discriminator can collide in the high bytes.)
