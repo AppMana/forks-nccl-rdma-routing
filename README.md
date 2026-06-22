@@ -87,9 +87,29 @@ needed. Relevant NCCL env:
 
 | Variable | Value | Why |
 | --- | --- | --- |
-| `NCCL_IB_HCA` | `usb4_rdma` | the rails to route across |
+| `NCCL_IB_HCA` | `usb4_rdma,rxe_lan` | the rails **and** a reaches-all fallback (soft-RoCE on the LAN) for non-adjacent collective edges |
 | `NCCL_IB_ADDR_FAMILY` | `AF_INET6` | use the per-link ULA GIDs, not v4-mapped |
 | `NCCL_IB_MERGE_NICS` | `0` | do not fuse rails into one virtual device |
+| `NCCL_IB_SUBNET_AWARE_ROUTING` | `prefer_hca[usb4_rdma\d*,rxe_lan\d*]` | enable subnet-aware routing **and** set HCA preference (see below) |
+
+### `NCCL_IB_SUBNET_AWARE_ROUTING` — an expression, not just a flag
+
+Stock 2.30.x treats this as `0`/`1`. This fork extends it: the value can carry an
+HCA **preference**, because the reaches-all fallback (rxe over the LAN) matches
+*every* peer's subnet — so without a preference, an adjacent peer wrongly stays on
+the slow fallback instead of overriding to its fast rail.
+
+| Value | Behaviour |
+| --- | --- |
+| `0` / unset | off |
+| `1` | on, legacy keep-default |
+| `prefer_hca[p1,p2,…]` | on, and when several devices reach a peer, prefer the first whose name matches pattern `p1`, then `p2`, … |
+
+Patterns are POSIX ERE; `\d` (→ `[0-9]`) and a leading `/dev/` are accepted, so
+`prefer_hca[usb4_rdma\d*,rxe_lan\d*]` means **rail for adjacent neighbours, rxe
+only when no rail reaches** (the non-adjacent ring/tree edges). Implemented in
+`ibPreferReachableDev` (`src/transport/net_ib/subnet_match.h`), unit-tested in
+`rdma-routing/tests/subnet_match_test.cc`.
 
 An optional `NCCL_ROUTING_CONF_FILE` provides explicit reachability for topologies
 that subnet-sensing can't express.
