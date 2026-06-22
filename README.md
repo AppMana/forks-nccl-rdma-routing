@@ -1,86 +1,106 @@
-# NCCL
+# forks-nccl-rdma-routing
 
-Optimized primitives for inter-GPU communication.
+A fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.30.7**) that makes
+NCCL's `net_ib` transport **reachability-aware** when it selects which RDMA device
+(NIC / rail) to use for an inter-node connection.
 
-## Introduction
+The transport itself — QP management, the clear-to-send credit FIFO, RNR handling,
+multi-QP, registration cache — is **stock NCCL**. We change exactly one thing: how
+net_ib chooses *which* device to connect a given peer over. We do **not**
+reimplement the transport.
 
-NCCL (pronounced "Nickel") is a stand-alone library of standard communication routines for GPUs, implementing all-reduce, all-gather, reduce, broadcast, reduce-scatter, as well as any send/receive based communication pattern. It has been optimized to achieve high bandwidth on platforms using PCIe, NVLink, NVswitch, as well as networking using InfiniBand Verbs or TCP/IP sockets. NCCL supports an arbitrary number of GPUs installed in a single node or across multiple nodes, and can be used in either single- or multi-process (e.g., MPI) applications.
+## Why
 
-For more information on NCCL usage, please refer to the [NCCL documentation](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html).
+Stock NCCL assumes a **fully-connected** RDMA fabric — every NIC can reach every
+peer — so it picks the NIC for a connection by **GPU↔NIC PCI affinity**
+(`ncclTopoGetNetDev` → `ncclTopoGetLocalNet`). That assumption breaks on
+**partially-connected** fabrics:
+
+- **Thunderbolt rail chains.** Each node has 1–2 `usb4_rdma` rails; each rail
+  reaches only its **one cabled neighbour**. A mid-chain node's two rails sit on
+  **different per-link GID `/64` subnets** — rail A reaches the upstream neighbour,
+  rail B the downstream one, and neither reaches anyone else.
+- **Multi-plane / rail-optimised** datacentre networks where a NIC only reaches a
+  subset of peers.
+
+On these fabrics stock NCCL routinely selects a rail that **cannot reach** the
+peer. The connection then fails at `ibv_modify_qp(INIT→RTR)` with `ENETUNREACH`,
+or — with `NCCL_IB_MERGE_NICS=1` (the default) — stripes a single connection across
+*both* rails when only one of them reaches the peer.
+
+## The fix (one thing)
+
+net_ib already exchanges GIDs during connection setup. This fork adds a single
+capability: **select the local device whose GID `/64` subnet reaches the peer's
+GID**, falling back to the PCI-affinity choice, and then to a reaches-all device
+(e.g. soft-RoCE over the LAN), when no rail matches.
+
+The reachability decision is a small, pure, unit-tested module:
+
+- `rdma-routing/src/route.c` — `/64` subnet sensing + an optional explicit
+  reachability config file. Pure logic, no RDMA, device-agnostic.
+- `rdma-routing/tests/route_test.cc` — the contract (two ends of a link share a
+  `/64`; different links differ; a peerless rail is unreachable).
+
+The net_ib change is just the **call site** that consults it.
 
 ## Build
 
-Note: the official and tested builds of NCCL can be downloaded from: https://developer.nvidia.com/nccl. You can skip the following build steps if you choose to use the official builds.
-
-To build the library :
-
-```shell
-$ cd nccl
-$ make -j src.build
+```sh
+make -j src.build NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86"
+# -> build/lib/libnccl.so.2.30.7
 ```
 
-If CUDA is not installed in the default /usr/local/cuda path, you can define the CUDA path with :
+Standard NCCL build (see upstream `BUILD.md`). Pick `NVCC_GENCODE` for your GPUs.
 
-```shell
-$ make src.build CUDA_HOME=<path to cuda install>
+## Install — replacing the NCCL that ships with PyTorch
+
+PyTorch bundles its own NCCL (the `nvidia-nccl-cuXX` wheel, loaded at runtime from
+`<site-packages>/torch/lib/libnccl.so.2`). `torch.cuda.nccl.version()` reports the
+*compiled-against* version regardless of what is actually loaded — **trust the NCCL
+startup banner** (`NCCL version 2.30.7+…`) to confirm which library is live.
+
+### Option A — `LD_PRELOAD` (no rebuild of anything)
+
+```sh
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7 python your_app.py
 ```
 
-NCCL will be compiled and installed in `build/` unless `BUILDDIR` is set.
+### Option B — `.deb` that replaces torch's bundled NCCL
 
-By default, NCCL is compiled for all supported architectures. To accelerate the compilation and reduce the binary size, consider redefining `NVCC_GENCODE` (defined in `makefiles/common.mk`) to only include the architecture of the target platform :
-```shell
-$ make -j src.build NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"
+`packaging/` builds `libnccl-rdma-routing_2.30.7_amd64.deb`, which:
+
+1. installs `libnccl.so.2.30.7` (+ `libnccl.so.2` symlink) into
+   `/usr/lib/x86_64-linux-gnu/`, and
+2. repoints PyTorch's bundle at it, replacing the wheel's
+   `torch/lib/libnccl.so.2` with a symlink to the system library (the same move
+   the vLLM-Ampere image's `REPLACE_TORCH_BUNDLED_NCCL` step performs).
+
+```sh
+apt-get install -y ./libnccl-rdma-routing_2.30.7_amd64.deb
 ```
 
-## Install
+## Configuration
 
-To install NCCL on the system, create a package then install it as root.
+Reachability is **sensed from GID subnets** automatically — no per-node config
+needed. Relevant NCCL env:
 
-Debian/Ubuntu :
-```shell
-$ # Install tools to create debian packages
-$ sudo apt install build-essential devscripts debhelper fakeroot
-$ # Build NCCL deb package
-$ make pkg.debian.build
-$ ls build/pkg/deb/
-```
+| Variable | Value | Why |
+| --- | --- | --- |
+| `NCCL_IB_HCA` | `usb4_rdma` | the rails to route across |
+| `NCCL_IB_ADDR_FAMILY` | `AF_INET6` | use the per-link ULA GIDs, not v4-mapped |
+| `NCCL_IB_MERGE_NICS` | `0` | do not fuse rails into one virtual device |
 
-RedHat/CentOS :
-```shell
-$ # Install tools to create rpm packages
-$ sudo yum install rpm-build rpmdevtools
-$ # Build NCCL rpm package
-$ make pkg.redhat.build
-$ ls build/pkg/rpm/
-```
+An optional `NCCL_ROUTING_CONF_FILE` provides explicit reachability for topologies
+that subnet-sensing can't express.
 
-OS-agnostic tarball :
-```shell
-$ make pkg.txz.build
-$ ls build/pkg/txz/
-```
+## Layout
 
-Python wheel :
-```shell
-$ # Install uv to create the Python wheel (uv manages Python deps in a venv)
-$ # See: https://docs.astral.sh/uv/getting-started/installation/
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
-$ # Build NCCL Python wheel (this also builds the .txz archive as an intermediate)
-$ make pkg.python_wheel.build
-$ ls build/pkg/python_wheel/
-```
+- `rdma-routing/` — the reachability module (`route.c`) + its test suite.
+- `src/transport/net_ib.cc` — the patched device selection (the one change).
 
-## Tests
+## Relationship to upstream
 
-Tests for NCCL are maintained separately at https://github.com/nvidia/nccl-tests.
-
-```shell
-$ git clone https://github.com/NVIDIA/nccl-tests.git
-$ cd nccl-tests
-$ make
-$ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
-```
-
-## Copyright
-
-All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+Tracks `v2.30.7-1`. The intent is a minimal, rebase-friendly diff: one routing
+module plus one call site in net_ib, so the fork stays trivial to carry forward to
+later NCCL releases.
