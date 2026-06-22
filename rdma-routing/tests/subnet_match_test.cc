@@ -8,6 +8,7 @@
 // is the single definition net_ib/connect.cc also includes).
 #include <gtest/gtest.h>
 #include <string.h>
+#include <infiniband/verbs.h>   // union ibv_gid (subnet_match.h leaves this to the includer)
 #include "subnet_match.h"
 
 // IPv6 GID: /64 prefix in raw[0..7], interface id in raw[8..15].
