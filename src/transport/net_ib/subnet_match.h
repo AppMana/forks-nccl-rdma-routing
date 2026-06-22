@@ -13,7 +13,11 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include <infiniband/verbs.h>
+// NOTE: do NOT include <infiniband/verbs.h> here. net_ib uses NCCL's vendored
+// verbs definitions (src/include/ibvcore.h, unless NCCL_BUILD_RDMA_CORE); pulling
+// in the system header alongside it conflicts on `struct verbs_context`. The
+// includer provides `union ibv_gid` -- ibvcore.h via ibvwrap.h in connect.cc, or
+// the system <infiniband/verbs.h> in the standalone unit test.
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <string.h>
