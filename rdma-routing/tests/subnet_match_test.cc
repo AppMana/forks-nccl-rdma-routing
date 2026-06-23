@@ -103,6 +103,61 @@ TEST(PreferHca, DevPathPrefixStripped) {
   EXPECT_EQ(ibPreferReachableDev(names, reach, 2, R"(/dev/usb4_rdma\d*)"), 0);
 }
 
+// --- the ADVERTISEMENT layer (the real bug) ---
+// ncclIbListen embeds only the affinity-default device's GID. On a rail chain the
+// default is the flat fallback (rxe), so the rails are never advertised and the
+// peer can never match one -> every connection collapses onto rxe. The fix must
+// advertise EVERY device's GID.
+static void mkRaw(uint8_t g[16], uint8_t linkTag, uint64_t iface) {
+  memset(g, 0, 16);
+  g[0] = 0xfd; g[1] = linkTag; g[2] = linkTag; g[3] = linkTag;
+  for (int i = 0; i < 8; i++) g[8 + i] = (uint8_t)(iface >> (8 * (7 - i)));
+}
+
+TEST(AdvertiseGids, MustOfferEveryDeviceGidNotJustDefault) {
+  uint8_t devGids[3][16];
+  mkRaw(devGids[0], 0xA1, 1);                 // rail to neighbour A
+  mkRaw(devGids[1], 0xB2, 1);                 // rail to neighbour B
+  memset(devGids[2], 0, 16);                  // rxe: flat /64, distinct
+  devGids[2][0] = 0xfd; devGids[2][1] = 0x5a; devGids[2][2] = 0x80; devGids[2][15] = 1;
+  int valid[3] = {1, 1, 1};
+  uint8_t out[8][16];
+  int n = ibCollectAdvertiseGids(devGids, valid, 3, /*defaultDev=rxe*/2, out, 8);
+  EXPECT_EQ(n, 3) << "must advertise all devices, not just the affinity default (rxe)";
+  bool hasRailA = false, hasRailB = false;
+  for (int i = 0; i < n; i++) {
+    if (memcmp(out[i], devGids[0], 16) == 0) hasRailA = true;
+    if (memcmp(out[i], devGids[1], 16) == 0) hasRailB = true;
+  }
+  EXPECT_TRUE(hasRailA) << "rail-to-A GID must be advertised so the peer can match it";
+  EXPECT_TRUE(hasRailB);
+}
+
+// End-to-end consequence: a peer whose rail shares B's rail0 /64 can only "reach"
+// B over the rail if B advertised that rail's GID. With the default-only stub it
+// can't -> it (correctly, given the inputs) falls to rxe. This is the layer my
+// earlier picker test skipped.
+TEST(AdvertiseGids, PeerReachesRailOnlyIfRailGidAdvertised) {
+  uint8_t devGids[3][16];
+  mkRaw(devGids[0], 0xA1, 1);                 // B rail to A
+  mkRaw(devGids[1], 0xB2, 1);                 // B rail to C
+  memset(devGids[2], 0, 16);
+  devGids[2][0] = 0xfd; devGids[2][1] = 0x5a; devGids[2][15] = 1;   // B rxe (flat)
+  int valid[3] = {1, 1, 1};
+  uint8_t out[8][16];
+  int n = ibCollectAdvertiseGids(devGids, valid, 3, 2, out, 8);
+
+  union ibv_gid aRailToB;                     // peer A's rail, same link /64 as B rail0
+  mkRaw(aRailToB.raw, 0xA1, 2);
+  bool railReachable = false;
+  for (int i = 0; i < n; i++) {
+    union ibv_gid adv;
+    memcpy(adv.raw, out[i], 16);
+    if (gidSameSubnet(&aRailToB, &adv, 64)) railReachable = true;
+  }
+  EXPECT_TRUE(railReachable) << "peer can reach B's rail only if B advertised the rail GID";
+}
+
 // Two links that share the first 32 bits but differ in bits 33-64 must STILL be
 // different subnets -- i.e. the IPv6 path compares the full /64, not an IPv4
 // /<=32 prefix. (Our FNV-hash discriminator can collide in the high bytes.)

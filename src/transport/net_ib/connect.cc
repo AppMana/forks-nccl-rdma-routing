@@ -48,14 +48,21 @@ struct ncclIbCommStage {
   void* comm;
 };
 
+// How many of the listener's device GIDs we embed in the handle. Must cover every
+// RoCE device the node exposes (rails + reaches-all fallback), so the connector can
+// match whichever shares its /64 -- not just the affinity-default device. Bounded by
+// the handle's NCCL_NET_HANDLE_MAXSIZE(128) budget: base handle is ~96B, so 3 GIDs
+// (48B -> ~112B) is the max that fits. A chain node has 2 usb4_rdma rails + 1 rxe = 3.
+#define NCCL_IB_LISTEN_GIDS 3
+
 struct ncclIbHandle {
   union ncclSocketAddress connectAddr; // Filled by the target
   uint64_t magic; // random number to help debugging
   struct ncclIbCommStage stage; // Used by the other side when connecting
-  // GIDs of the listener's device PFs, used by the connector to find a local
-  // NIC on the same subnet (for multi-subnet RoCE direct-connect topologies).
-  // Zero-valued slots are ignored (validGid() returns false).
-  union ibv_gid listenGids[2];
+  // GIDs of ALL the listener's RoCE devices (not just the affinity-default), used
+  // by the connector to find a local NIC on the same subnet as whichever of ours
+  // reaches it. Zero-valued slots are ignored (validGid() returns false).
+  union ibv_gid listenGids[NCCL_IB_LISTEN_GIDS];
 };
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
@@ -619,21 +626,33 @@ ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenC
   NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
   NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
 
-  // Embed GIDs of all PFs in the handle so the connector can find a local NIC
-  // on the same subnet as any of our ports.
-  if (ibSubnetAwareEnabled() && dev < ncclNMergedIbDevs) {
-    struct ncclIbMergedDev* mDev = ncclIbMergedDevs + dev;
-    int gidSlot = 0;
-    for (int i = 0; i < mDev->vProps.ndevs && gidSlot < 2; i++) {
-      int ibDevN = mDev->vProps.devs[i];
-      ncclIbDev* ibDev = ncclIbDevs + ibDevN;
-      if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
-      int gidIndex;
-      NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex), ret, fail);
-      NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &handle->listenGids[gidSlot]), ret,
-                    fail);
-      gidSlot++;
+  // Embed the GIDs of EVERY RoCE device in the handle (not just the affinity-default
+  // merged dev) so the connector can find a local NIC on the same /64 as whichever of
+  // ours reaches it. On a Thunderbolt rail chain the default is the flat fallback
+  // (rxe); advertising only it means the connector can never match a rail and every
+  // connection collapses onto rxe. Selection of which to advertise = ibCollectAdvertiseGids
+  // (unit-tested in rdma-routing/tests/subnet_match_test.cc).
+  if (ibSubnetAwareEnabled()) {
+    uint8_t devGids[NCCL_IB_LISTEN_GIDS][16];
+    int devValid[NCCL_IB_LISTEN_GIDS];
+    int nd = 0;
+    for (int d = 0; d < ncclNIbDevs && nd < NCCL_IB_LISTEN_GIDS; d++) {
+      ncclIbDev* ibDev = ncclIbDevs + d;
+      devValid[nd] = 0;
+      if (ibDev->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+        int gidIndex;
+        union ibv_gid g;
+        memset(&g, 0, sizeof(g));
+        if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) == ncclSuccess &&
+            wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &g) == ncclSuccess && validGid(&g)) {
+          memcpy(devGids[nd], g.raw, 16);
+          devValid[nd] = 1;
+        }
+      }
+      nd++;
     }
+    ibCollectAdvertiseGids((const uint8_t(*)[16])devGids, devValid, nd, dev,
+                           (uint8_t(*)[16])handle->listenGids, NCCL_IB_LISTEN_GIDS);
   }
 
   *listenComm = comm;
@@ -813,7 +832,7 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
   // Subnet-aware device selection: use the listener's GIDs (embedded in the
   // handle) to find a local NIC on the same subnet as the remote peer.
   // For single-subnet or IB deployments, all GIDs are zero → dev stays unchanged.
-  if (ibSubnetAwareEnabled()) NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, 2, dev, &dev));
+  if (ibSubnetAwareEnabled()) NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, NCCL_IB_LISTEN_GIDS, dev, &dev));
 
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;

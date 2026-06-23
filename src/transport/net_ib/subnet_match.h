@@ -105,4 +105,20 @@ static inline int ibPreferReachableDev(const char** devNames, const int* reachab
   return -1;                                        // nothing reachable matched any pattern
 }
 
+// Collect the GIDs a node advertises in its listen handle / connect metadata, so
+// a peer can match whichever of OUR devices shares its /64 (a rail), not just the
+// PCI-affinity default. On a Thunderbolt rail chain the default is the flat
+// fallback (rxe), so advertising only it means the peer can NEVER match a rail
+// and every connection collapses onto rxe. Writes up to maxOut GIDs to out[],
+// returns the count. devValid[d] != 0 means device d has a usable RoCE GID.
+static inline int ibCollectAdvertiseGids(const uint8_t devGids[][16], const int* devValid,
+                                         int nDevs, int defaultDev, uint8_t out[][16], int maxOut) {
+  (void)defaultDev;  // advertise ALL devices, not just the affinity default
+  int n = 0;
+  for (int d = 0; d < nDevs && n < maxOut; d++) {
+    if (devValid[d]) memcpy(out[n++], devGids[d], 16);
+  }
+  return n;
+}
+
 #endif // NCCL_NET_IB_SUBNET_MATCH_H_
