@@ -1,0 +1,19 @@
+ARG BUILD_BASE=nvidia/cuda:13.0.2-devel-ubuntu22.04
+ARG BASE=harbor.appmana.com/appmana/vllm-ampere:ibverbs-cpufanout-f429eddee-20260612
+FROM ${BUILD_BASE} AS nccl-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git ca-certificates python3 python-is-python3 libibverbs-dev && rm -rf /var/lib/apt/lists/*
+COPY . /nccl-src
+WORKDIR /nccl-src
+RUN make -j"$(nproc)" src.build CUDA_HOME=/usr/local/cuda \
+      NVCC_GENCODE="-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_86,code=compute_86" \
+ && ls -la build/lib/libnccl.so*
+FROM ${BASE}
+USER root
+SHELL ["/bin/bash","-o","pipefail","-c"]
+COPY --from=nccl-build /nccl-src/build/lib/libnccl.so.2.30.7 /usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7
+RUN set -eux; cd /usr/lib/x86_64-linux-gnu; rm -f libnccl.so.2.30.4 libnccl.so.2 libnccl.so; \
+    ln -sf libnccl.so.2.30.7 libnccl.so.2; ln -sf libnccl.so.2 libnccl.so; \
+    TORCH_LIB="$(python3 -c 'import torch,os;print(os.path.dirname(torch.__file__)+"/lib")')"; \
+    if [ -e "$TORCH_LIB/libnccl.so.2" ]; then mv -f "$TORCH_LIB/libnccl.so.2" "$TORCH_LIB/libnccl.so.2.bundled"; ln -sf /usr/lib/x86_64-linux-gnu/libnccl.so.2 "$TORCH_LIB/libnccl.so.2"; fi; \
+    ldconfig; ls -la libnccl.so*
