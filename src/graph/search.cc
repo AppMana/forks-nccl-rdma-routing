@@ -1397,6 +1397,67 @@ fail:
 // 0: don't use PXN for P2P, 1: use PXN if needed, 2: use PXN as much as possible to maximize aggregation
 NCCL_PARAM(P2pPxnLevel, "P2P_PXN_LEVEL", 2);
 
+// rdma-routing: priority of a net-device NAME against NCCL_IB_SUBNET_AWARE_ROUTING's
+// prefer_hca[p0,p1,...] list. Lower index = higher priority. Each pattern's leading
+// name prefix (up to a regex/\\d metacharacter) is matched against the device name, so
+// "usb4_rdma\\d*" matches "usb4_rdma5". Returns a large value if no pattern matches.
+static int rrNameScore(const char* name, const char* patterns) {
+  int idx = 0;
+  const char* p = patterns;
+  while (*p) {
+    char pre[64]; int n = 0;
+    while (*p && *p != ',' && *p != '\\' && *p != '[' && *p != '*' && *p != '.' && n < 63) pre[n++] = *p++;
+    pre[n] = '\0';
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
+    if (n > 0 && strncmp(name, pre, n) == 0) return idx;
+    idx++;
+  }
+  return 1000000;
+}
+
+// rdma-routing: the graph layer picks the P2P net device by GPU PCI affinity, which on a
+// Thunderbolt rail chain selects the reaches-all fallback (rxe_lan) over the much faster
+// per-link usb4_rdma rail (rxe has the closer PCI path). Honor prefer_hca's NAME priority
+// here too: if the affinity pick is lower-priority (rxe) and a higher-priority device (a
+// rail) exists, switch to it. Safe for the P2P LISTEN side: the listener advertises ALL its
+// GIDs and the transport accept-side subnet remap aligns the recv to the connecting peer's
+// specific rail (and reverts to rxe for a genuinely non-adjacent peer no rail reaches).
+static void rrPreferRailNetDev(struct ncclComm* comm, int64_t* id, int* dev) {
+  if (dev == NULL || *dev < 0) return;
+  const char* env = ncclGetEnv("NCCL_IB_SUBNET_AWARE_ROUTING");
+  if (env == NULL) return;
+  const char* b = strstr(env, "prefer_hca[");
+  if (b == NULL) return;
+  b += strlen("prefer_hca[");
+  const char* e = strchr(b, ']');
+  if (e == NULL) e = b + strlen(b);
+  char patterns[256];
+  size_t pl = (size_t)(e - b);
+  if (pl >= sizeof(patterns)) pl = sizeof(patterns) - 1;
+  memcpy(patterns, b, pl); patterns[pl] = '\0';
+
+  ncclNetProperties_t props;
+  if (comm->ncclNet->getProperties(*dev, &props) != ncclSuccess) return;
+  int curScore = rrNameScore(props.name, patterns);
+  if (curScore == 0) return; // already the top-priority device
+
+  struct ncclTopoSystem* system = comm->topo;
+  int bestScore = curScore, bestDev = *dev;
+  int64_t bestId = id ? *id : -1;
+  for (int n = 0; n < system->nodes[NET].count; n++) {
+    int d = system->nodes[NET].nodes[n].net.dev;
+    if (comm->ncclNet->getProperties(d, &props) != ncclSuccess) continue;
+    int s = rrNameScore(props.name, patterns);
+    if (s < bestScore) { bestScore = s; bestDev = d; bestId = system->nodes[NET].nodes[n].id; }
+  }
+  if (bestDev != *dev) {
+    INFO(NCCL_GRAPH | NCCL_NET, "RRPREFER ncclTopoGetNetDev: rail preference overrode netDev %d -> %d", *dev, bestDev);
+    *dev = bestDev;
+    if (id) *id = bestId;
+  }
+}
+
 ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoGraph* graph, int channelId,
                                int peerRank, int64_t* id, int* dev, int* proxyRank) {
   int64_t netId = -1;
@@ -1473,5 +1534,13 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
       }
     }
   }
+  // rdma-routing: prefer a usb4_rdma rail over the rxe fallback for the P2P (graph==NULL)
+  // path; leave graph-driven collective channels (which may legitimately span to a
+  // non-adjacent peer over rxe) to the transport-layer subnet remap.
+  if (graph == NULL) {
+    rrPreferRailNetDev(comm, id ? id : &netId, dev);
+    if (id) netId = *id;
+  }
+  INFO(NCCL_GRAPH|NCCL_NET, "RRTRACE ncclTopoGetNetDev: rank %d peer %d ch %d -> netDev %d (netId 0x%lx) graph=%d", rank, peerRank, channelId, dev ? *dev : -1, (long)netId, graph ? 1 : 0);
   return ncclSuccess;
 }
