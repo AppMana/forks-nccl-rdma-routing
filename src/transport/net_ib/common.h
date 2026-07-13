@@ -37,6 +37,11 @@
 extern char ncclIbIfName[MAX_IF_NAME_SIZE + 1];
 extern union ncclSocketAddress ncclIbIfAddr;
 
+// Load the declared inter-node topology graph (NCCL_NODE_TO_NODE_TOPO_FILE)
+// exactly once. Called at plugin init (after ncclIbIfAddr is known); safe to
+// call again from the connect/accept paths. Defined in connect.cc.
+void ncclIbNodeTopoLoadOnce(void);
+
 enum ncclIbRequestMatchingScheme {
   BY_INDEX = 0,
   BY_ID = 1,

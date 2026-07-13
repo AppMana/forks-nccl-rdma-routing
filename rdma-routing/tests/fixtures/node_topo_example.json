@@ -1,0 +1,15 @@
+{
+  "10.2.0.1": {
+    "usb4_rdma5": { "neighbors": ["10.2.0.2"], "weight": 10 },
+    "rxe_lan":    { "neighbors": ["10.2.0.2", "10.2.0.3"], "weight": 100 }
+  },
+  "10.2.0.2": {
+    "usb4_rdma5":  { "neighbors": ["10.2.0.1"], "weight": 10 },
+    "usb4_rdma15": { "neighbors": ["10.2.0.3"], "weight": 10 },
+    "rxe_lan":     { "neighbors": ["10.2.0.1", "10.2.0.3"], "weight": 100 }
+  },
+  "10.2.0.3": {
+    "usb4_rdma15": { "neighbors": ["10.2.0.2"], "weight": 10 },
+    "rxe_lan":     { "neighbors": ["10.2.0.1", "10.2.0.2"], "weight": 100 }
+  }
+}
