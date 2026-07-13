@@ -358,25 +358,27 @@ static bool matchGidAddrPrefix(sa_family_t af, void* prefix, int prefixlen, unio
   return (prefixlen == 0) ? true : false;
 }
 
-static bool configuredGid(union ibv_gid* gid) {
-  const struct in6_addr* a = (struct in6_addr*)gid->raw;
-  int trailer = (a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]);
-  if (((a->s6_addr32[0] | trailer) == 0UL) || ((a->s6_addr32[0] == htonl(0xfe800000)) && (trailer == 0UL))) {
-    return false;
-  }
-  return true;
-}
+// configuredGid/linkLocalGid/validGid moved to subnet_match.h (single
+// definition, shared with the rail/fallback selection and its unit tests).
 
-static bool linkLocalGid(union ibv_gid* gid) {
-  const struct in6_addr* a = (struct in6_addr*)gid->raw;
-  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL) {
-    return true;
+// All valid GIDs of a device's FULL GID table (not just the one index
+// ncclIbGetGidIndex selects -- that selection is what races SLAAC ordering and
+// NCCL_IB_ADDR_FAMILY). Deduplicated, capped. This is what makes the
+// advertisement self-contained: the rail's per-link ULA is always in here no
+// matter which index the primary selection landed on.
+#define NCCL_IB_DEV_GID_TABLE_CAP 8
+static int ibDevQueryValidGids(struct ncclIbDev* ibDev, uint8_t (*out)[16], int maxOut) {
+  int n = 0;
+  for (int i = 0; i < ibDev->portAttr.gid_tbl_len && n < maxOut; i++) {
+    union ibv_gid g;
+    memset(&g, 0, sizeof(g));
+    if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, i, &g) != ncclSuccess) continue;
+    if (!validGid(&g)) continue;
+    bool dup = false;
+    for (int j = 0; j < n && !dup; j++) dup = (memcmp(out[j], g.raw, 16) == 0);
+    if (!dup) memcpy(out[n++], g.raw, 16);
   }
-  return false;
-}
-
-static bool validGid(union ibv_gid* gid) {
-  return (configuredGid(gid) && !linkLocalGid(gid));
+  return n;
 }
 
 static ncclResult_t ncclIbRoceGetVersionNum(const char* deviceName, int portNum, int gidIndex, int* version) {
@@ -673,6 +675,71 @@ static bool ibMergedDevReachesPeer(int devIdx, union ibv_gid* remoteGids, int nR
   return checked > 0 && matched == checked;
 }
 
+// Self-inferring rail/fallback selection -- the DEFAULT device-selection path
+// when prefer_hca[...] is configured, shared by the connector and acceptor call
+// sites (via ncclIbFindDevBySubnet). No external file, no DNS, no route lookup:
+//   - RAIL (every prefer pattern but the last, e.g. usb4_rdma\d*): selected iff
+//     ANY of the peer's advertised GIDs shares that rail's /64. The per-link
+//     ULA is deterministic -- both cabled ends share it -- so this is reliable.
+//   - FALLBACK (the last pattern, e.g. rxe_lan\d*): selected UNCONDITIONALLY
+//     when no rail matched. Never subnet-matched: rxe_lan carries multiple
+//     prefixes whose GID ordering races SLAAC at boot, and requiring a match
+//     there is what left the ring-closing hop on a usb4 rail toward a
+//     non-adjacent peer and hung the 10-rank all-reduce.
+//   - Neither -> keep the caller's default (WARN: silence has cost us days).
+static ncclResult_t ncclIbSelectDevByRailOrFallback(union ibv_gid* remoteGids, int nRemoteGids, int prefixLen,
+                                                    const char* prefer, int defaultDev, int* foundDev) {
+  *foundDev = defaultDev;
+  int n = ncclNMergedIbDevs > MAX_IB_VDEVS ? MAX_IB_VDEVS : ncclNMergedIbDevs;
+  const char* names[MAX_IB_VDEVS];
+  for (int d = 0; d < n; d++) names[d] = ncclIbMergedDevs[d].devName;
+
+  // Flat (gid, merged-dev) list over the FULL GID table of every RoCE member
+  // device -- the local half of the inference needs no advertisement at all.
+  enum { LOCAL_GID_CAP = 128 };
+  uint8_t localGids[LOCAL_GID_CAP][16];
+  int localGidDev[LOCAL_GID_CAP];
+  int nLocal = 0;
+  for (int d = 0; d < n; d++) {
+    struct ncclIbMergedDev* mDev = ncclIbMergedDevs + d;
+    for (int i = 0; i < mDev->vProps.ndevs && nLocal < LOCAL_GID_CAP; i++) {
+      struct ncclIbDev* ibDev = ncclIbDevs + mDev->vProps.devs[i];
+      if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
+      uint8_t table[NCCL_IB_DEV_GID_TABLE_CAP][16];
+      int nT = ibDevQueryValidGids(ibDev, table, NCCL_IB_DEV_GID_TABLE_CAP);
+      for (int g = 0; g < nT && nLocal < LOCAL_GID_CAP; g++) {
+        memcpy(localGids[nLocal], table[g], 16);
+        localGidDev[nLocal++] = d;
+      }
+    }
+  }
+
+  bool anyValidPeer = false;
+  for (int r = 0; r < nRemoteGids && !anyValidPeer; r++) anyValidPeer = validGid(&remoteGids[r]);
+
+  int how = -1;
+  int pick = ibRailSelectDev(names, n, localGids, localGidDev, nLocal, (const uint8_t(*)[16])remoteGids, nRemoteGids,
+                             prefixLen, prefer, &how);
+  if (pick < 0) {
+    WARN("NET/IB: rail routing: no local rail shares a /64 with any of the peer's %d advertised GIDs and no local "
+         "device matches the fallback pattern (prefer_hca[%s]); keeping default dev %d",
+         nRemoteGids, prefer, defaultDev);
+    return ncclSuccess;
+  }
+  if (!anyValidPeer) {
+    WARN("NET/IB: rail routing: peer advertised no valid GID (empty or malformed metadata); using the unconditional "
+         "fallback dev %d (%s)",
+         pick, names[pick]);
+  }
+  if (pick != defaultDev) {
+    INFO(NCCL_NET, "NET/IB: rail routing: %s -> dev %d (%s), overriding default dev %d",
+         how == IB_RAIL_SELECT_RAIL ? "peer GID on a rail /64" : "no rail match, unconditional fallback", pick,
+         names[pick], defaultDev);
+  }
+  *foundDev = pick;
+  return ncclSuccess;
+}
+
 static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemoteGids, int defaultDev, int* foundDev) {
   *foundDev = defaultDev;
 
@@ -682,36 +749,23 @@ static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemote
     return ncclInvalidArgument;
   }
 
+  // prefer_hca[...]: self-inferring rail/fallback selection. Rails (all
+  // patterns but the last) require a shared /64 with a peer-advertised GID;
+  // the fallback (last pattern) is unconditional. This replaces the old
+  // reach-based preference which still subnet-matched the fallback and so
+  // found NOTHING for a non-adjacent peer whose rxe_lan /64 differed.
+  const char* prefer = ibSubnetPreferList();
+  if (prefer) {
+    return ncclIbSelectDevByRailOrFallback(remoteGids, nRemoteGids, prefixLen, prefer, defaultDev, foundDev);
+  }
+
+  // Legacy path (NCCL_IB_SUBNET_AWARE_ROUTING=1 without prefer_hca), unchanged.
   // Quick check: if no remote GID is valid, nothing to do.
   bool anyValid = false;
   for (int r = 0; r < nRemoteGids; r++) {
     if (validGid(&remoteGids[r])) { anyValid = true; break; }
   }
   if (!anyValid) return ncclSuccess;
-
-  // prefer_hca[...]: among the devices that reach the peer, pick the one whose
-  // name best matches the configured priority list (the rail before the flat
-  // fallback). The flat fallback reaches EVERY peer, so without this an adjacent
-  // peer wrongly stays on it instead of overriding to its much faster rail.
-  const char* prefer = ibSubnetPreferList();
-  if (prefer) {
-    const char* names[MAX_IB_VDEVS];
-    int reach[MAX_IB_VDEVS];
-    int n = ncclNMergedIbDevs > MAX_IB_VDEVS ? MAX_IB_VDEVS : ncclNMergedIbDevs;
-    for (int d = 0; d < n; d++) {
-      names[d] = ncclIbMergedDevs[d].devName;
-      reach[d] = ibMergedDevReachesPeer(d, remoteGids, nRemoteGids, prefixLen) ? 1 : 0;
-    }
-    int pick = ibPreferReachableDev(names, reach, n, prefer);
-    if (pick >= 0) {
-      if (pick != defaultDev)
-        INFO(NCCL_NET, "NET/IB: Subnet-aware routing (prefer_hca): dev %d -> dev %d", defaultDev, pick);
-      *foundDev = pick;
-      return ncclSuccess;
-    }
-    // No preferred device reaches the peer (e.g. a non-adjacent ring/tree edge):
-    // fall through so the keep-default/search still routes it over the fallback.
-  }
 
   // Keep the default device if all its RoCE PFs reach the peer (preserves NIC
   // Fusion when both ports connect to the same destination).
@@ -746,29 +800,65 @@ ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenC
   // merged dev) so the connector can find a local NIC on the same /64 as whichever of
   // ours reaches it. On a Thunderbolt rail chain the default is the flat fallback
   // (rxe); advertising only it means the connector can never match a rail and every
-  // connection collapses onto rxe. Selection of which to advertise = ibCollectAdvertiseGids
-  // (unit-tested in rdma-routing/tests/subnet_match_test.cc).
+  // connection collapses onto rxe. Selection of which to advertise:
+  // prefer_hca set  -> ibCollectAdvertiseGidsBfs, full GID table per device,
+  //                    rails first (rdma-routing/tests/rail_select_test.cc);
+  // plain "1" mode  -> ibCollectAdvertiseGids, one GID per device, unchanged
+  //                    (rdma-routing/tests/subnet_match_test.cc).
   if (ibSubnetAwareEnabled()) {
-    uint8_t devGids[NCCL_IB_LISTEN_GIDS][16];
-    int devValid[NCCL_IB_LISTEN_GIDS];
-    int nd = 0;
-    for (int d = 0; d < ncclNIbDevs && nd < NCCL_IB_LISTEN_GIDS; d++) {
-      ncclIbDev* ibDev = ncclIbDevs + d;
-      devValid[nd] = 0;
-      if (ibDev->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET) {
-        int gidIndex;
-        union ibv_gid g;
-        memset(&g, 0, sizeof(g));
-        if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) == ncclSuccess &&
-            wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &g) == ncclSuccess && validGid(&g)) {
-          memcpy(devGids[nd], g.raw, 16);
-          devValid[nd] = 1;
+    const char* prefer = ibSubnetPreferList();
+    if (prefer) {
+      // Self-inferring path: every valid GID of every RoCE device's FULL table
+      // (not just the raced selected index), rails before the fallback,
+      // breadth-first across devices, capped by the handle's 3 slots. The rail
+      // ULAs always make it on the wire; the fallback needs no GID to be
+      // selected (it is unconditional on the connector), so losing its slot to
+      // a rail costs nothing.
+      int nd = ncclNIbDevs > MAX_IB_DEVS ? MAX_IB_DEVS : ncclNIbDevs;
+      uint8_t gids[MAX_IB_DEVS * NCCL_IB_DEV_GID_TABLE_CAP][16];
+      int gidDev[MAX_IB_DEVS * NCCL_IB_DEV_GID_TABLE_CAP];
+      int devIsRail[MAX_IB_DEVS];
+      int nGids = 0;
+      for (int d = 0; d < nd; d++) {
+        ncclIbDev* ibDev = ncclIbDevs + d;
+        devIsRail[d] = ibDevIsRail(ibDev->devName, prefer);
+        if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
+        uint8_t table[NCCL_IB_DEV_GID_TABLE_CAP][16];
+        int nT = ibDevQueryValidGids(ibDev, table, NCCL_IB_DEV_GID_TABLE_CAP);
+        for (int g = 0; g < nT; g++) {
+          memcpy(gids[nGids], table[g], 16);
+          gidDev[nGids++] = d;
         }
       }
-      nd++;
+      int adv = ibCollectAdvertiseGidsBfs((const uint8_t(*)[16])gids, gidDev, nGids, devIsRail, nd,
+                                          (uint8_t(*)[16])handle->listenGids, NCCL_IB_LISTEN_GIDS);
+      if (adv == 0)
+        WARN("NET/IB: rail routing: this node has no valid RoCE GID to advertise in its listen handle; "
+             "connectors will select their unconditional fallback");
+    } else {
+      // Legacy ("1" without prefer_hca): one GID per device at the selected
+      // index, unchanged.
+      uint8_t devGids[NCCL_IB_LISTEN_GIDS][16];
+      int devValid[NCCL_IB_LISTEN_GIDS];
+      int nd = 0;
+      for (int d = 0; d < ncclNIbDevs && nd < NCCL_IB_LISTEN_GIDS; d++) {
+        ncclIbDev* ibDev = ncclIbDevs + d;
+        devValid[nd] = 0;
+        if (ibDev->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+          int gidIndex;
+          union ibv_gid g;
+          memset(&g, 0, sizeof(g));
+          if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) == ncclSuccess &&
+              wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &g) == ncclSuccess && validGid(&g)) {
+            memcpy(devGids[nd], g.raw, 16);
+            devValid[nd] = 1;
+          }
+        }
+        nd++;
+      }
+      ibCollectAdvertiseGids((const uint8_t(*)[16])devGids, devValid, nd, dev,
+                             (uint8_t(*)[16])handle->listenGids, NCCL_IB_LISTEN_GIDS);
     }
-    ibCollectAdvertiseGids((const uint8_t(*)[16])devGids, devValid, nd, dev,
-                           (uint8_t(*)[16])handle->listenGids, NCCL_IB_LISTEN_GIDS);
   }
 
   *listenComm = comm;
@@ -1107,6 +1197,19 @@ ib_recv_dev_list:
                   ret, fail);
     devInfo->gid.global.subnet_prefix = commDev->base.gidInfo.localGid.global.subnet_prefix;
     devInfo->gid.global.interface_id = commDev->base.gidInfo.localGid.global.interface_id;
+
+    // Advertise the device's OTHER valid GIDs too (full table, not just the
+    // selected index), so the acceptor's rail /64 match cannot be starved by
+    // GID-index selection races. Rides in former padding + the send-unused
+    // remoteGid slot: wire size unchanged, old peers see zeros and ignore it.
+    // prefer_hca-gated so unset env AND plain "1" mode send byte-identical
+    // metadata to stock.
+    if (ibSubnetPreferList() != NULL && ibDev->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+      uint8_t table[NCCL_IB_DEV_GID_TABLE_CAP][16];
+      int nT = ibDevQueryValidGids(ibDev, table, NCCL_IB_DEV_GID_TABLE_CAP);
+      ibDevInfoPackGids(devInfo->gid.raw, table, nT, &devInfo->advGidMagic, &devInfo->advGidCount,
+                        devInfo->remoteGid.raw);
+    }
 
     // info logging
     for (int q = 0; q < comm->base.nqps; q++) {
@@ -1637,11 +1740,24 @@ ib_recv:
       topoDecided = true;
     }
     if (!topoDecided && ibSubnetAwareEnabled() && remMeta.ndevs > 0) {
-      union ibv_gid remoteGids[NCCL_IB_MAX_DEVS_PER_NIC];
+      // EVERY GID each remote device advertised (primary + the extra slot when
+      // the peer speaks the multi-GID format; old single-GID peers degrade to
+      // just .gid inside ibDevInfoUnpackGids). The extra GID is what carries a
+      // rail's per-link ULA when the primary got e.g. a v4-mapped face. The
+      // multi-GID unpack is prefer_hca-only so plain "1" mode keeps today's
+      // exact single-GID behaviour.
+      bool multiGid = (ibSubnetPreferList() != NULL);
+      union ibv_gid remoteGids[NCCL_IB_MAX_DEVS_PER_NIC * NCCL_IB_DEV_ADV_GIDS];
       int nRemoteGids = 0;
       for (int i = 0; i < remMeta.ndevs && i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
         if (remMeta.devs[i].link_layer == IBV_LINK_LAYER_ETHERNET) {
-          remoteGids[nRemoteGids++] = remMeta.devs[i].gid;
+          if (multiGid) {
+            nRemoteGids += ibDevInfoUnpackGids(remMeta.devs[i].gid.raw, remMeta.devs[i].advGidMagic,
+                                               remMeta.devs[i].advGidCount, remMeta.devs[i].remoteGid.raw,
+                                               (uint8_t(*)[16]) & remoteGids[nRemoteGids], NCCL_IB_DEV_ADV_GIDS);
+          } else {
+            remoteGids[nRemoteGids++] = remMeta.devs[i].gid;
+          }
         }
       }
       NCCLCHECKGOTO(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, lComm->dev, &effectiveDev), ret, fail);
@@ -1781,6 +1897,16 @@ ib_recv:
     meta.devs[i].gid.global.subnet_prefix = rCommDev->base.gidInfo.localGid.global.subnet_prefix;
     meta.devs[i].gid.global.interface_id = rCommDev->base.gidInfo.localGid.global.interface_id;
     meta.devs[i].mtu = ibDev->portAttr.active_mtu;
+    // Multi-GID advertisement (same as the connector side): the connector has
+    // already selected its device, but the reply stays self-describing and old
+    // peers ignore the former-padding bytes. prefer_hca-gated: unset env and
+    // plain "1" mode send stock bytes.
+    if (ibSubnetPreferList() != NULL && ibDev->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+      uint8_t table[NCCL_IB_DEV_GID_TABLE_CAP][16];
+      int nT = ibDevQueryValidGids(ibDev, table, NCCL_IB_DEV_GID_TABLE_CAP);
+      ibDevInfoPackGids(meta.devs[i].gid.raw, table, nT, &meta.devs[i].advGidMagic, &meta.devs[i].advGidCount,
+                        meta.devs[i].remoteGid.raw);
+    }
   }
   meta.addr = (uint64_t)rComm->cmplsRecords;
   meta.sl = remMeta.sl;

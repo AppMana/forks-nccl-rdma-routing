@@ -127,6 +127,15 @@ extern int ncclIbRelaxedOrderingEnabled;
 struct ncclIbDevInfo {
   uint32_t lid;
   uint8_t ib_port;
+  // WIRE-COMPAT multi-GID advertisement (subnet-aware routing). These two bytes
+  // occupy what used to be struct padding after ib_port: old peers memset their
+  // metadata, so they always send 0 here -- advGidMagic != NCCL_IB_DEV_GIDS_MAGIC
+  // means "old single-GID peer" and the receiver degrades to .gid alone
+  // (ibDevInfoUnpackGids in subnet_match.h). Struct size and every other field
+  // offset are unchanged (static_asserts below), so mixed old/new fleets
+  // exchange metadata byte-for-byte compatibly.
+  uint8_t advGidMagic;
+  uint8_t advGidCount;  // total advertised GIDs incl. .gid, <= NCCL_IB_DEV_ADV_GIDS
   enum ibv_mtu mtu;
   uint8_t link_layer;
 
@@ -143,9 +152,20 @@ struct ncclIbDevInfo {
   // registered the completion records structure (on the specific device).
   uint32_t rkey;
 
-  // remote dev info
+  // remote dev info. ON THE WIRE this slot was never meaningfully sent (both
+  // sides memset their metadata and overwrite it from .gid on receipt --
+  // connect.cc), so when advGidMagic is set it carries the device's ONE extra
+  // advertised GID (e.g. the rail's per-link ULA when .gid got a v4-mapped
+  // face). Runtime use after receipt is unchanged.
   union ibv_gid remoteGid;
 };
+// The multi-GID advertisement rides in former padding + the send-unused
+// remoteGid slot: the wire layout must be bit-identical to the old struct.
+static_assert(offsetof(struct ncclIbDevInfo, mtu) == 8, "ncclIbDevInfo wire layout changed (mtu)");
+static_assert(offsetof(struct ncclIbDevInfo, gid) == 16, "ncclIbDevInfo wire layout changed (gid)");
+static_assert(offsetof(struct ncclIbDevInfo, rkey) == 32, "ncclIbDevInfo wire layout changed (rkey)");
+static_assert(offsetof(struct ncclIbDevInfo, remoteGid) == 40, "ncclIbDevInfo wire layout changed (remoteGid)");
+static_assert(sizeof(struct ncclIbDevInfo) == 56, "ncclIbDevInfo wire size changed");
 
 // Retain local RoCE address for error logging
 struct ncclIbGidInfo {

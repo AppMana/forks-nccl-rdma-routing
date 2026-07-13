@@ -40,6 +40,11 @@ if(RDMAROUTE_TESTS)
   add_executable(subnet_match_test tests/subnet_match_test.cc)
   target_include_directories(subnet_match_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/net_ib)
   target_link_libraries(subnet_match_test PRIVATE GTest::gtest_main)
+  # Self-inferring rail/fallback selection + multi-GID wire advertisement (the
+  # DEFAULT path underneath the NCCL_NODE_TO_NODE_TOPO_FILE override).
+  add_executable(rail_select_test tests/rail_select_test.cc)
+  target_include_directories(rail_select_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/net_ib)
+  target_link_libraries(rail_select_test PRIVATE GTest::gtest_main)
   # Explicit inter-node topology graph (NCCL_NODE_TO_NODE_TOPO_FILE), the
   # declared replacement for gidSameSubnet reachability inference.
   add_executable(node_topo_test tests/node_topo_test.cc)
@@ -51,5 +56,6 @@ if(RDMAROUTE_TESTS)
   gtest_discover_tests(route_test)
   gtest_discover_tests(cts_test)
   gtest_discover_tests(subnet_match_test)
+  gtest_discover_tests(rail_select_test)
   gtest_discover_tests(node_topo_test)
 endif()
