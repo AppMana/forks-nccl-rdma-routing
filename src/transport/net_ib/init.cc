@@ -309,6 +309,11 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
         goto fail;
       }
 
+      // Load the declared inter-node topology graph (NCCL_NODE_TO_NODE_TOPO_FILE)
+      // once, now that the OOB address (the graph's local-node key) is known.
+      // Unset/malformed -> WARN inside + legacy gidSameSubnet behaviour.
+      ncclIbNodeTopoLoadOnce();
+
       // Detect IB cards
       int nIbDevs;
       struct ibv_device** devices;

@@ -9,6 +9,8 @@
 #include "common.h"
 #include "p2p_resiliency.h"
 #include "subnet_match.h"  // getGidAddrFamily + gidSameSubnet (single definition; unit-tested)
+#include "node_topo.h"     // NCCL_NODE_TO_NODE_TOPO_FILE declared inter-node graph (unit-tested)
+#include <pthread.h>
 
 NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
@@ -97,6 +99,120 @@ static const char* ibSubnetPreferList(void) {
   memcpy(buf, b, n);
   buf[n] = '\0';
   return buf;
+}
+
+// ---- NCCL_NODE_TO_NODE_TOPO_FILE: declared inter-node topology graph ----
+// NCCL's native NCCL_TOPO_FILE/NCCL_GRAPH_FILE are INTRA-node only; base NCCL
+// assumes a full-mesh network between nodes. On the Thunderbolt chain the
+// network is a LINE, and inferring per-peer reachability from advertised GID
+// /64s (gidSameSubnet below) is fragile: an interface carries many IPv6
+// addresses, rxe_lan's GID index ordering races with SLAAC at boot, and only
+// ONE GID per device goes on the wire -- so a ring-closing hop between two
+// nodes that advertised rxe_lan on different /64s finds no reachable device,
+// NCCL keeps a usb4 rail for a non-adjacent peer, and the collective hangs.
+// When the env var is set, the graph (keyed by OOB node IP, the address NCCL
+// bootstraps on) takes precedence for device selection; unset keeps the
+// gidSameSubnet behaviour byte-for-byte. Graph logic + JSON parsing live in
+// node_topo.h (hardware-free, unit-tested in rdma-routing/tests/node_topo_test.cc).
+static pthread_once_t ibNodeTopoOnce = PTHREAD_ONCE_INIT;
+static ncclNodeTopo ibNodeTopoGraph;
+static ncclNodeTopoAddr ibNodeTopoLocal;
+static bool ibNodeTopoIsActive = false;  // file set + parsed + local node resolved
+
+// union ncclSocketAddress -> graph address (v4-mapped v6 canonicalized to v4,
+// matching ncclNodeTopoAddrFromString so textual graph keys compare equal).
+static int ibNodeTopoAddrFromSock(const union ncclSocketAddress* sa, ncclNodeTopoAddr* out) {
+  memset(out, 0, sizeof(*out));
+  if (sa == NULL) return -1;
+  if (sa->sa.sa_family == AF_INET) {
+    out->family = AF_INET;
+    memcpy(out->bytes, &sa->sin.sin_addr, 4);
+    return 0;
+  }
+  if (sa->sa.sa_family == AF_INET6) {
+    if (IN6_IS_ADDR_V4MAPPED(&sa->sin6.sin6_addr)) {
+      out->family = AF_INET;
+      memcpy(out->bytes, sa->sin6.sin6_addr.s6_addr + 12, 4);
+    } else {
+      out->family = AF_INET6;
+      memcpy(out->bytes, sa->sin6.sin6_addr.s6_addr, 16);
+    }
+    return 0;
+  }
+  return -1;
+}
+
+// Load once at plugin init (after ncclIbIfAddr is known), never per-connect.
+// Any problem -> WARN loudly (silent fallback cost us days) and stay on the
+// legacy gidSameSubnet path; never fail init, never hang differently.
+static void ibNodeTopoLoad(void) {
+  const char* path = getenv("NCCL_NODE_TO_NODE_TOPO_FILE");
+  if (path == NULL || path[0] == '\0') return;  // unset -> unchanged legacy behaviour
+  char err[NCCL_NODE_TOPO_ERRMSG_MAX];
+  if (ncclNodeTopoLoadFile(path, &ibNodeTopoGraph, err, sizeof(err)) != 0) {
+    WARN("NET/IB: NCCL_NODE_TO_NODE_TOPO_FILE=%s: %s; falling back to GID subnet inference", path, err);
+    return;
+  }
+  char line[SOCKET_NAME_MAXLEN + 1];
+  if (ibNodeTopoAddrFromSock(&ncclIbIfAddr, &ibNodeTopoLocal) != 0) {
+    WARN("NET/IB: NCCL_NODE_TO_NODE_TOPO_FILE=%s: local OOB address has unsupported family; falling back to GID "
+         "subnet inference",
+         path);
+    return;
+  }
+  if (ncclNodeTopoFindNode(&ibNodeTopoGraph, &ibNodeTopoLocal) < 0) {
+    WARN("NET/IB: NCCL_NODE_TO_NODE_TOPO_FILE=%s: local OOB address %s is not a node key in the graph; falling back "
+         "to GID subnet inference",
+         path, ncclSocketToString(&ncclIbIfAddr, line, 1));
+    return;
+  }
+  ibNodeTopoIsActive = true;
+  INFO(NCCL_INIT | NCCL_NET, "NET/IB: node topo graph loaded from %s: %d nodes, local node %s", path,
+       ibNodeTopoGraph.nNodes, ncclSocketToString(&ncclIbIfAddr, line, 1));
+}
+
+void ncclIbNodeTopoLoadOnce(void) { pthread_once(&ibNodeTopoOnce, ibNodeTopoLoad); }
+
+// Graph-driven device selection for the connection to `remoteAddr` (the peer's
+// OOB address). Returns 1 when the graph decided (*foundDev set to the merged
+// device of the minimum-weight local interface whose declared neighbors
+// contain the peer), 0 when the caller must keep its default / legacy path:
+// graph inactive, peer not a declared neighbor on any local interface (WARN),
+// or the selected interface name maps to no local ibverbs device (WARN).
+static int ncclIbFindDevByNodeTopo(const union ncclSocketAddress* remoteAddr, int defaultDev, int* foundDev) {
+  if (!ibNodeTopoIsActive) return 0;
+  char line[SOCKET_NAME_MAXLEN + 1];
+  ncclNodeTopoAddr remote;
+  if (ibNodeTopoAddrFromSock(remoteAddr, &remote) != 0) {
+    WARN("NET/IB: node topo: cannot resolve the peer's OOB address; falling back to GID subnet inference");
+    return 0;
+  }
+  const ncclNodeTopoIface* ranked[NCCL_NODE_TOPO_MAX_IFACES];
+  int n = ncclNodeTopoRankIfaces(&ibNodeTopoGraph, &ibNodeTopoLocal, &remote, ranked, NCCL_NODE_TOPO_MAX_IFACES);
+  if (n == 0) {
+    WARN("NET/IB: node topo: peer %s is not a declared neighbor on any local interface; keeping default dev %d "
+         "(GID subnet inference)",
+         ncclSocketToString(remoteAddr, line, 1), defaultDev);
+    return 0;
+  }
+  for (int r = 0; r < n; r++) {
+    for (int d = 0; d < ncclNMergedIbDevs; d++) {
+      struct ncclIbMergedDev* mDev = ncclIbMergedDevs + d;
+      bool match = strcmp(mDev->devName, ranked[r]->devName) == 0;
+      for (int i = 0; !match && i < mDev->vProps.ndevs; i++)
+        match = strcmp(ncclIbDevs[mDev->vProps.devs[i]].devName, ranked[r]->devName) == 0;
+      if (!match) continue;
+      if (d != defaultDev)
+        INFO(NCCL_NET, "NET/IB: node topo: peer %s -> dev %d (%s), overriding default dev %d",
+             ncclSocketToString(remoteAddr, line, 1), d, mDev->devName, defaultDev);
+      *foundDev = d;
+      return 1;
+    }
+  }
+  WARN("NET/IB: node topo: graph selected interface '%s' for peer %s but no local ibverbs device has that name; "
+       "falling back to GID subnet inference",
+       ranked[0]->devName, ncclSocketToString(remoteAddr, line, 1));
+  return 0;
 }
 
 ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context, int cqSize) {
@@ -829,10 +945,21 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
   ncclResult_t ret = ncclSuccess;
   struct ncclIbHandle* handle = (struct ncclIbHandle*)opaqueHandle;
 
-  // Subnet-aware device selection: use the listener's GIDs (embedded in the
-  // handle) to find a local NIC on the same subnet as the remote peer.
-  // For single-subnet or IB deployments, all GIDs are zero → dev stays unchanged.
-  if (ibSubnetAwareEnabled()) NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, NCCL_IB_LISTEN_GIDS, dev, &dev));
+  // Device selection, in precedence order:
+  // 1) Declared inter-node topology graph (NCCL_NODE_TO_NODE_TOPO_FILE): the
+  //    listener's OOB address is the graph key for the remote node. It is
+  //    right here in the handle -- handle->connectAddr, filled by the target's
+  //    ncclIbListen from its OOB listen socket (bound to ncclIbIfAddr).
+  // 2) GID subnet inference (NCCL_IB_SUBNET_AWARE_ROUTING) from the listener's
+  //    GIDs embedded in the handle. Byte-for-byte legacy behaviour when 1) is
+  //    unset or could not decide (which WARNs).
+  ncclIbNodeTopoLoadOnce();
+  int topoDev;
+  if (ncclIbFindDevByNodeTopo(&handle->connectAddr, dev, &topoDev)) {
+    dev = topoDev;
+  } else if (ibSubnetAwareEnabled()) {
+    NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, NCCL_IB_LISTEN_GIDS, dev, &dev));
+  }
 
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
@@ -1492,19 +1619,33 @@ ib_recv:
   /* copy back the received info */
   memcpy(&remMeta, stage->buffer, sizeof(struct ncclIbConnectionMetadata));
 
-  // Subnet-aware device selection: use the remote sender's GIDs to find a local
-  // NIC on the same subnet. Override lComm->dev and update vProps if a
-  // better device is found.
-  if (ibSubnetAwareEnabled() && remMeta.ndevs > 0) {
-    union ibv_gid remoteGids[NCCL_IB_MAX_DEVS_PER_NIC];
-    int nRemoteGids = 0;
-    for (int i = 0; i < remMeta.ndevs && i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
-      if (remMeta.devs[i].link_layer == IBV_LINK_LAYER_ETHERNET) {
-        remoteGids[nRemoteGids++] = remMeta.devs[i].gid;
-      }
-    }
+  // Device selection (receiver side), in precedence order:
+  // 1) Declared inter-node topology graph (NCCL_NODE_TO_NODE_TOPO_FILE): the
+  //    connecting peer's OOB address -- the accepted socket's remote IP
+  //    (ncclSocketAccept stored it in rComm->base.sock.addr) -- is the graph
+  //    key for the remote node.
+  // 2) GID subnet inference from the sender's advertised GIDs (legacy
+  //    behaviour, unchanged when 1) is unset or could not decide).
+  // Override lComm->dev and update vProps if a better device is found.
+  {
     int effectiveDev = lComm->dev;
-    NCCLCHECKGOTO(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, lComm->dev, &effectiveDev), ret, fail);
+    bool topoDecided = false;
+    ncclIbNodeTopoLoadOnce();
+    union ncclSocketAddress peerAddr;
+    if (ncclSocketGetAddr(&rComm->base.sock, &peerAddr) == ncclSuccess &&
+        ncclIbFindDevByNodeTopo(&peerAddr, lComm->dev, &effectiveDev)) {
+      topoDecided = true;
+    }
+    if (!topoDecided && ibSubnetAwareEnabled() && remMeta.ndevs > 0) {
+      union ibv_gid remoteGids[NCCL_IB_MAX_DEVS_PER_NIC];
+      int nRemoteGids = 0;
+      for (int i = 0; i < remMeta.ndevs && i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
+        if (remMeta.devs[i].link_layer == IBV_LINK_LAYER_ETHERNET) {
+          remoteGids[nRemoteGids++] = remMeta.devs[i].gid;
+        }
+      }
+      NCCLCHECKGOTO(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, lComm->dev, &effectiveDev), ret, fail);
+    }
     if (effectiveDev != lComm->dev) {
       lComm->dev = effectiveDev;
       rComm->base.vProps = ncclIbMergedDevs[effectiveDev].vProps;
