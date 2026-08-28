@@ -366,19 +366,20 @@ static bool matchGidAddrPrefix(sa_family_t af, void* prefix, int prefixlen, unio
 // NCCL_IB_ADDR_FAMILY). Deduplicated, capped. This is what makes the
 // advertisement self-contained: the rail's per-link ULA is always in here no
 // matter which index the primary selection landed on.
-#define NCCL_IB_DEV_GID_TABLE_CAP 8
+static int ibDevQueryGidAt(void* context, int index, uint8_t gid[16]) {
+  struct ncclIbDev* ibDev = (struct ncclIbDev*)context;
+  union ibv_gid value;
+  memset(&value, 0, sizeof(value));
+  if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, index, &value) != ncclSuccess) return -1;
+  memcpy(gid, value.raw, 16);
+  return 0;
+}
+
 static int ibDevQueryValidGids(struct ncclIbDev* ibDev, uint8_t (*out)[16], int maxOut) {
-  int n = 0;
-  for (int i = 0; i < ibDev->portAttr.gid_tbl_len && n < maxOut; i++) {
-    union ibv_gid g;
-    memset(&g, 0, sizeof(g));
-    if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, i, &g) != ncclSuccess) continue;
-    if (!validGid(&g)) continue;
-    bool dup = false;
-    for (int j = 0; j < n && !dup; j++) dup = (memcmp(out[j], g.raw, 16) == 0);
-    if (!dup) memcpy(out[n++], g.raw, 16);
-  }
-  return n;
+  std::lock_guard<std::mutex> lock(ibDev->mutex);
+  return ibGetValidGidSnapshot(ibDev->portAttr.gid_tbl_len, ibDevQueryGidAt, ibDev, ibDev->gidTableGeneration,
+                               &ibDev->gidSnapshotGeneration, &ibDev->gidSnapshotCount, ibDev->gidSnapshot,
+                               NCCL_IB_DEV_GID_TABLE_CAP, out, maxOut);
 }
 
 static ncclResult_t ncclIbRoceGetVersionNum(const char* deviceName, int portNum, int gidIndex, int* version) {

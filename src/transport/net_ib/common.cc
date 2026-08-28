@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "p2p_resiliency.h"
+#include "subnet_match.h"
 
 char ncclIbIfName[MAX_IF_NAME_SIZE + 1];
 union ncclSocketAddress ncclIbIfAddr;
@@ -150,6 +151,10 @@ void* ncclIbAsyncThreadMain(void* args) {
       WARN("NET/IB : %s:%d async fatal event on SRQ, unused for now (%p): %s", dev->devName, dev->portNum, srq, str);
       break;
     case IBV_EVENT_GID_CHANGE:
+      {
+        std::lock_guard<std::mutex> lock(dev->mutex);
+        ibGidSnapshotInvalidate(&dev->gidTableGeneration, &dev->gidSnapshotGeneration, &dev->gidSnapshotCount);
+      }
       WARN("NET/IB : %s:%d GID table changed", dev->devName, dev->portNum);
       break;
     case IBV_EVENT_DEVICE_SPEED_CHANGE:

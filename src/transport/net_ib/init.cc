@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "p2p_resiliency_recovery.h"
+#include "subnet_match.h"
 
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
@@ -404,6 +405,10 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
             ncclIbDevs[ncclNIbDevs].ibProvider = ibProvider;
             ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;
             ncclIbDevs[ncclNIbDevs].portAttr = portAttr;
+            ibGidSnapshotInit(&ncclIbDevs[ncclNIbDevs].gidTableGeneration,
+                              &ncclIbDevs[ncclNIbDevs].gidSnapshotGeneration,
+                              &ncclIbDevs[ncclNIbDevs].gidSnapshotCount,
+                              ncclIbDevs[ncclNIbDevs].gidSnapshot, NCCL_IB_DEV_GID_TABLE_CAP);
             ncclIbDevs[ncclNIbDevs].portNum = port_num;
             ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;
             // A non-zero active_speed_ex indicates XDR rate (0x100) or higher

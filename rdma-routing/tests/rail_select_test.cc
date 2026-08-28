@@ -348,6 +348,76 @@ TEST(AdvertiseBfs, CapTruncates) {
   EXPECT_EQ(n, 2);
 }
 
+// A software-RDMA device can expose a 1024-entry GID table even when only one
+// non-link-local entry is populated. Listen, peer selection, and connection
+// metadata all consume the same table generation; they must share its snapshot
+// rather than issuing a complete table query independently.
+struct SparseGidTable {
+  uint8_t gids[1024][16] = {};
+  int queryCount = 0;
+};
+
+int querySparseGid(void* context, int index, uint8_t gid[16]) {
+  auto* table = static_cast<SparseGidTable*>(context);
+  table->queryCount++;
+  memcpy(gid, table->gids[index], 16);
+  return 0;
+}
+
+TEST(GidCollection, RepeatedConsumersShareOneSparseTableGeneration) {
+  SparseGidTable table;
+  mkLinkLocal(table.gids[0], 1);
+  mkGid(table.gids[1], 0xa1, 1);
+
+  uint64_t generation, validGeneration;
+  int cachedCount;
+  uint8_t cachedGids[8][16];
+  ibGidSnapshotInit(&generation, &validGeneration, &cachedCount, cachedGids, 8);
+  uint8_t listenGids[8][16];
+  uint8_t selectionGids[8][16];
+  uint8_t metadataGids[8][16];
+  EXPECT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, listenGids, 8), 1);
+  EXPECT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, selectionGids, 8), 1);
+  EXPECT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, metadataGids, 8), 1);
+
+  EXPECT_EQ(memcmp(listenGids[0], selectionGids[0], 16), 0);
+  EXPECT_EQ(memcmp(listenGids[0], metadataGids[0], 16), 0);
+  EXPECT_EQ(table.queryCount, 1024)
+    << "one unchanged device generation should be queried once, not once per consumer";
+}
+
+TEST(GidCollection, InvalidationRefreshesSparseTableOnce) {
+  SparseGidTable table;
+  mkGid(table.gids[1], 0xa1, 1);
+
+  uint64_t generation, validGeneration;
+  int cachedCount;
+  uint8_t cachedGids[8][16];
+  uint8_t out[8][16];
+  ibGidSnapshotInit(&generation, &validGeneration, &cachedCount, cachedGids, 8);
+
+  ASSERT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, out, 8), 1);
+  EXPECT_EQ(table.queryCount, 1024);
+  uint8_t oldGid[16];
+  memcpy(oldGid, out[0], 16);
+
+  mkGid(table.gids[1], 0xc3, 2);
+  ibGidSnapshotInvalidate(&generation, &validGeneration, &cachedCount);
+  ASSERT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, out, 8), 1);
+  EXPECT_EQ(table.queryCount, 2048);
+  EXPECT_NE(memcmp(out[0], oldGid, 16), 0);
+  EXPECT_EQ(memcmp(out[0], table.gids[1], 16), 0);
+
+  ASSERT_EQ(ibGetValidGidSnapshot(1024, querySparseGid, &table, generation, &validGeneration, &cachedCount,
+                                  cachedGids, 8, out, 8), 1);
+  EXPECT_EQ(table.queryCount, 2048) << "the refreshed generation should also be reused";
+}
+
 // ---------------------------------------------------------------------------
 // validGid (relocated verbatim from connect.cc so selection and tests share the
 // single definition): zero and link-local are not advertisable/matchable.
