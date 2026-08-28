@@ -87,7 +87,6 @@ struct ncclIbGidInfo {
 };
 
 extern int ncclNIbDevs;
-
 enum ncclIbRailPolicy {
   NCCL_IB_RAIL_POLICY_NONE,
   NCCL_IB_RAIL_POLICY_CX9_FLIP, // Enable CX9 rail flipped layout
@@ -95,6 +94,7 @@ enum ncclIbRailPolicy {
   NCCL_IB_RAIL_POLICY_CX9_BLOCK, // Enable CX9 rail blocked layout
 };
 
+#define NCCL_IB_DEV_GID_TABLE_CAP 8
 struct alignas(64) ncclIbDev {
   std::mutex mutex;
   int device;
@@ -119,6 +119,10 @@ struct alignas(64) ncclIbDev {
   int ar; // ADAPTIVE_ROUTING
   uint32_t oooRqSize;  // valid only when ar=1
   struct ibv_port_attr portAttr;
+  uint64_t gidTableGeneration;
+  uint64_t gidSnapshotGeneration;
+  int gidSnapshotCount;
+  uint8_t gidSnapshot[NCCL_IB_DEV_GID_TABLE_CAP][16];
   struct ncclIbStats stats;
   int dmaBufSupported;
   int16_t railId;

@@ -128,6 +128,56 @@ static inline bool validGid(union ibv_gid* gid) {
   return (configuredGid(gid) && !linkLocalGid(gid));
 }
 
+// Query callback used by the full-table GID collector. Keeping the table walk
+// here makes its query cost hardware-free and unit-testable while the transport
+// adapter in connect.cc remains responsible for calling ibverbs.
+typedef int (*ibQueryGidAtFn)(void* context, int index, uint8_t gid[16]);
+
+static inline int ibCollectValidGidsFromTable(int gidTableLen, ibQueryGidAtFn queryGid, void* queryContext,
+                                              uint8_t (*out)[16], int maxOut) {
+  int n = 0;
+  for (int i = 0; i < gidTableLen && n < maxOut; i++) {
+    union ibv_gid gid;
+    memset(&gid, 0, sizeof(gid));
+    if (queryGid(queryContext, i, gid.raw) != 0 || !validGid(&gid)) continue;
+    bool duplicate = false;
+    for (int j = 0; j < n && !duplicate; j++) duplicate = (memcmp(out[j], gid.raw, 16) == 0);
+    if (!duplicate) memcpy(out[n++], gid.raw, 16);
+  }
+  return n;
+}
+
+// Caller-owned snapshot state. `generation` identifies the device's current
+// GID-table generation; `validGeneration == generation` means cachedGids and
+// cachedCount describe it. Callers provide synchronization around get and
+// invalidate so a GID-change event cannot publish a partially filled snapshot.
+static inline void ibGidSnapshotInit(uint64_t* generation, uint64_t* validGeneration, int* cachedCount,
+                                     uint8_t (*cachedGids)[16], int cacheCapacity) {
+  *generation = 1;
+  *validGeneration = 0;
+  *cachedCount = 0;
+  memset(cachedGids, 0, (size_t)cacheCapacity * 16);
+}
+
+static inline void ibGidSnapshotInvalidate(uint64_t* generation, uint64_t* validGeneration, int* cachedCount) {
+  // Keep zero reserved for "no valid snapshot", including after wraparound.
+  if (++*generation == 0) *generation = 1;
+  *validGeneration = 0;
+  *cachedCount = 0;
+}
+
+static inline int ibGetValidGidSnapshot(int gidTableLen, ibQueryGidAtFn queryGid, void* queryContext,
+                                        uint64_t generation, uint64_t* validGeneration, int* cachedCount,
+                                        uint8_t (*cachedGids)[16], int cacheCapacity, uint8_t (*out)[16], int maxOut) {
+  if (*validGeneration != generation) {
+    *cachedCount = ibCollectValidGidsFromTable(gidTableLen, queryGid, queryContext, cachedGids, cacheCapacity);
+    *validGeneration = generation;
+  }
+  int n = *cachedCount < maxOut ? *cachedCount : maxOut;
+  for (int i = 0; i < n; i++) memcpy(out[i], cachedGids[i], 16);
+  return n;
+}
+
 // ---------------------------------------------------------------------------
 // Self-inferring rail/fallback device selection (the DEFAULT path underneath
 // the optional NCCL_NODE_TO_NODE_TOPO_FILE override).
