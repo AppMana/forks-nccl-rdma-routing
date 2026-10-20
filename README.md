@@ -1,184 +1,74 @@
-# forks-nccl-rdma-routing
+# forks-nccl-rdma-routing (`nccl-usb4`)
 
-A fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.30.7**) that makes
-NCCL's `net_ib` transport **reachability-aware** when it selects which RDMA device
-(NIC / rail) to use for an inter-node connection.
+Fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.32.3-1**) that adds reachability-aware RDMA device selection to `net_ib` and packages the routed `libnccl.so.2` together with the `libtbrxe` userspace `libibverbs` provider as a single Python wheel (`nccl-usb4==2.32.3`).
 
-The transport itself — QP management, the clear-to-send credit FIFO, RNR handling,
-multi-QP, registration cache — is **stock NCCL**. We change exactly one thing: how
-net_ib chooses *which* device to connect a given peer over. We do **not**
-reimplement the transport.
+## Why This Fork Exists
 
-## Why
+1. **Per-peer RDMA rail selection on non-full-mesh fabrics**:
+   Stock NCCL assumes every RDMA NIC (`ncclIbDevs`) can reach every peer on a shared fabric and assigns NICs to channels strictly by local GPU-to-NIC PCI affinity (`ncclTopoGetNetDev`). On point-to-point USB4/Thunderbolt chains (`thunderbolt_frame_rxe`), each `usb4_rdma*` HCA is a direct cable to a single adjacent node on its own `/64` IPv6 ULA subnet, while non-adjacent nodes are only reachable via soft-RoCE over Ethernet (`rxe_lan`). Stock NCCL either selects a `usb4_rdma*` rail that cannot reach a non-adjacent peer or selects the slow `rxe_lan` fallback for an adjacent peer because `rxe_lan`'s backing PCI NIC is closer in the PCI tree than the PCI-less virtual HCA.
+2. **Why routing lives in `net_ib` rather than an external `ncclNet` plugin**:
+   NCCL's topology engine (`src/graph/search.cc`) and collective/P2P channel setup choose the `dev` index before calling `ncclNet->connect(dev, ...)` / `listen(dev, ...)`. External `ncclNet` plugins also assume every IB device has a sysfs PCI path and fail on virtual `usb4_rdma*` HCAs.
+3. **Why the userspace `tbrxe` provider is bundled**:
+   On the host kernel (`AppMana/forks-thunderbolt`), `thunderbolt_frame_rxe.ko` implements the standard kernel `rxe` uverbs ABI over lossless USB4 XDomain frames (`thunderbolt_frame.ko`), but registers under private RDMA driver ID `0x55534234` (`"USB4"`) so unloading `rdma_rxe` never tears down USB4 RDMA rails. Because `libibverbs` matches providers by kernel driver ID and stamps that ID into every `uverbs` ioctl header, userspace needs `libtbrxe-rdmav34.so` (`ibverbs/tbrxe/tbrxe.c`), which compiles the `rdma-core` `rxe` provider bound exclusively to driver ID `0x55534234`.
 
-Stock NCCL assumes a **fully-connected** RDMA fabric — every NIC can reach every
-peer — so it picks the NIC for a connection by **GPU↔NIC PCI affinity**
-(`ncclTopoGetNetDev` → `ncclTopoGetLocalNet`). That assumption breaks on
-**partially-connected** fabrics:
+## Changes Relative to Upstream `NVIDIA/nccl` (`v2.32.3-1`)
 
-- **Thunderbolt rail chains.** Each node has 1–2 `usb4_rdma` rails; each rail
-  reaches only its **one cabled neighbour**. A mid-chain node's two rails sit on
-  **different per-link GID `/64` subnets** — rail A reaches the upstream neighbour,
-  rail B the downstream one, and neither reaches anyone else.
-- **Multi-plane / rail-optimised** datacentre networks where a NIC only reaches a
-  subset of peers.
+- **`src/transport/net_ib/subnet_match.h`, `connect.cc`, `common.{h,cc}`, `init.cc`**:
+  - **Wire-compatible multi-GID advertisement**: Packs a second valid GID per device into `ncclIbDevInfo` using two former padding bytes (`advGidMagic = 0xB6`, `advGidCount`) and the send-unused `remoteGid` field. `sizeof(ncclIbDevInfo)` and all field offsets are unchanged (`static_assert`-checked in `common.h`).
+  - **Generation-cached GID snapshots**: Caches valid GIDs per `ncclIbDev` (`ibGetValidGidSnapshot`) and invalidates the cache on `IBV_EVENT_GID_CHANGE`.
+  - **`NCCL_IB_SUBNET_AWARE_ROUTING=prefer_hca[...]`**: Extends `NCCL_IB_SUBNET_AWARE_ROUTING` beyond `0`/`1` to accept an ordered HCA regex list (e.g. `prefer_hca[usb4_rdma\d*,rxe_lan\d*]`). During connection setup, `ibRailSelectDev` selects a matching rail whose `/64` subnet reaches the peer's advertised GIDs and falls back to the last pattern (`rxe_lan`) when no rail matches.
+- **`src/transport/net_ib/node_topo.h`**:
+  - **`NCCL_NODE_TO_NODE_TOPO_FILE`**: Optional JSON topology file mapping `(node_oob_ip, ib_dev) -> {neighbors, weight}` for deterministic minimum-weight direct-edge selection before GID subnet sensing.
+- **`src/graph/search.cc`**:
+  - Applies `prefer_hca[...]` priority in `ncclTopoGetNetDev` for P2P channels (`graph == NULL`) so P2P listeners and connectors prefer `usb4_rdma*` rails over `rxe_lan`.
+- **`ibverbs/tbrxe/`**:
+  - Userspace `libibverbs` provider (`tbrxe.c`, `tbrxe.driver`, `CMakeLists.txt`) binding kernel driver ID `0x55534234` (`RDMA_DRIVER_USB4_RDMA`).
+- **`python/` (`nccl-usb4`)**:
+  - Standalone Python wheel builder (`python/build_wheel.py`) and runtime activation module (`python/nccl_usb4/__init__.py`).
+- **`rdma-routing/tests/`**:
+  - Standalone GTest suite (`subnet_match_test.cc`, `rail_select_test.cc`, `node_topo_test.cc` — 57 tests) that compiles and runs without GPUs or RDMA hardware.
 
-On these fabrics stock NCCL routinely selects a rail that **cannot reach** the
-peer. The connection then fails at `ibv_modify_qp(INIT→RTR)` with `ENETUNREACH`,
-or — with `NCCL_IB_MERGE_NICS=1` (the default) — stripes a single connection across
-*both* rails when only one of them reaches the peer.
+## Single-Package Installation (`nccl-usb4==2.32.3`)
 
-## The fix (one thing)
-
-net_ib already exchanges GIDs during connection setup. This fork adds a single
-capability: **select the local device whose GID `/64` subnet reaches the peer's
-GID**, falling back to the PCI-affinity choice, and then to a reaches-all device
-(e.g. soft-RoCE over the LAN), when no rail matches.
-
-The reachability decision is a small, pure, unit-tested module:
-
-- `rdma-routing/src/route.c` — `/64` subnet sensing + an optional explicit
-  reachability config file. Pure logic, no RDMA, device-agnostic.
-- `rdma-routing/tests/route_test.cc` — the contract (two ends of a link share a
-  `/64`; different links differ; a peerless rail is unreachable).
-
-The net_ib change is just the **call site** that consults it.
-
-## Build
+Containers and virtual environments do not need any `.deb` packages beyond standard distro `libibverbs1`:
 
 ```sh
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86"
-# -> build/lib/libnccl.so.2.30.7
+pip install --extra-index-url https://nodes.appmana.com/simple/ "nccl-usb4==2.32.3"
 ```
 
-Standard NCCL build (see upstream `BUILD.md`). Pick `NVCC_GENCODE` for your GPUs.
+The `nccl-usb4` wheel contains:
+1. `nccl_usb4/nccl/lib/libnccl.so.2` — routed NCCL `2.32.3`
+2. `nccl_usb4/ibverbs/libtbrxe-rdmav34.so` and `nccl_usb4/ibverbs/tbrxe.driver` — userspace `libibverbs` provider (`0.2.73`) for `thunderbolt_frame_rxe`
+3. `nccl_usb4.pth` — startup hook that invokes `nccl_usb4.activate()` at Python interpreter initialization:
+   - Loads `libibverbs.so.1` and `libtbrxe-rdmav34.so` with `RTLD_GLOBAL` (registering driver ID `0x55534234` via its ELF constructor) and, when `/etc/libibverbs.d` and `/usr/lib/x86_64-linux-gnu/libibverbs` are writable (e.g. in container builds/runtimes), installs `tbrxe.driver`, `libtbrxe-rdmav34.so`, and `/etc/appmana/usb4-rdma-provider-version`.
+   - Places `<site-packages>/nccl_usb4` at `sys.path[0]` and preloads `nccl_usb4/nccl/lib/libnccl.so.2` with `RTLD_GLOBAL`. When `import torch` executes `torch._preload_cuda_deps()`, its `_get_cuda_dep_paths(path, "nccl", "libnccl.so.*[0-9]")` scan matches `sys.path[0]/nccl/lib/libnccl.so.2` first and skips `site-packages/nvidia/nccl/lib/libnccl.so.2`.
+   - Sets `VLLM_NCCL_SO_PATH` (if unset) to the bundled `libnccl.so.2` and `NCCL_NET_PLUGIN=none` (if unset).
 
-## Install — replacing the NCCL that ships with PyTorch
-
-PyTorch bundles its own NCCL (the `nvidia-nccl-cuXX` wheel, loaded at runtime from
-`<site-packages>/torch/lib/libnccl.so.2`). `torch.cuda.nccl.version()` reports the
-*compiled-against* version regardless of what is actually loaded — **trust the NCCL
-startup banner** (`NCCL version 2.30.7+…`) to confirm which library is live.
-
-### Option A — `LD_PRELOAD` (no rebuild of anything)
+## Building and Testing
 
 ```sh
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7 python your_app.py
+# 1. Run the 57 hardware-free routing unit tests
+cmake -S rdma-routing -B rdma-routing/build
+cmake --build rdma-routing/build -j
+ctest --test-dir rdma-routing/build --output-on-failure
+
+# 2. Build libnccl.so.2.32.3
+make -j16 src.build BUILDDIR="$PWD/build-2.32.3" \
+  NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
+
+# 3. Package the nccl-usb4 wheel and run Python verification tests
+python3 python/build_wheel.py --nccl-so build-2.32.3/lib/libnccl.so.2.32.3
+pip install --no-deps --force-reinstall dist/nccl_usb4-2.32.3-py3-none-manylinux_2_28_x86_64.whl
+pytest python/tests/test_nccl_usb4.py
 ```
 
-### Option B — `.deb` that replaces torch's bundled NCCL
+## Runtime Environment Variables
 
-`packaging/` builds `libnccl-rdma-routing_2.30.7_amd64.deb`, which:
-
-1. installs `libnccl.so.2.30.7` (+ `libnccl.so.2` symlink) into
-   `/usr/lib/x86_64-linux-gnu/`, and
-2. repoints PyTorch's bundle at it, replacing the wheel's
-   `torch/lib/libnccl.so.2` with a symlink to the system library (the same move
-   the vLLM-Ampere image's `REPLACE_TORCH_BUNDLED_NCCL` step performs).
-
-```sh
-apt-get install -y ./libnccl-rdma-routing_2.30.7_amd64.deb
-```
-
-## Configuration
-
-Reachability is either **declared explicitly** (`NCCL_NODE_TO_NODE_TOPO_FILE`,
-preferred) or **sensed from GID subnets** automatically. Relevant NCCL env:
-
-| Variable | Value | Why |
-| --- | --- | --- |
-| `NCCL_NODE_TO_NODE_TOPO_FILE` | `/etc/nccl/node-topo.json` | declared inter-node topology graph; takes precedence over GID sensing (see below) |
-| `NCCL_IB_HCA` | `usb4_rdma,rxe_lan` | the rails **and** a reaches-all fallback (soft-RoCE on the LAN) for non-adjacent collective edges |
-| `NCCL_IB_ADDR_FAMILY` | `AF_INET6` | use the per-link ULA GIDs, not v4-mapped |
-| `NCCL_IB_MERGE_NICS` | `0` | do not fuse rails into one virtual device |
-| `NCCL_IB_SUBNET_AWARE_ROUTING` | `prefer_hca[usb4_rdma\d*,rxe_lan\d*]` | enable subnet-aware routing **and** set HCA preference (see below) |
-
-### `NCCL_NODE_TO_NODE_TOPO_FILE` — the declared inter-node graph
-
-NCCL's native `NCCL_TOPO_FILE`/`NCCL_GRAPH_FILE` are *intra*-node only; base
-NCCL assumes a full-mesh network between nodes. On the Thunderbolt chain the
-inter-node network is a LINE, and inferring per-peer reachability from
-advertised GID /64s is fragile: an interface carries many IPv6 addresses
-across prefixes, `rxe_lan`'s GID index ordering races with SLAAC at boot, and
-only ONE GID per device goes on the wire — so a ring-closing hop between two
-nodes that advertised `rxe_lan` on different /64s finds no reachable device,
-NCCL keeps a usb4 rail toward a non-adjacent peer, and the collective hangs
-forever. The topo file replaces that inference with a declaration:
-
-```json
-{
-  "10.2.0.1": {
-    "usb4_rdma5": { "neighbors": ["10.2.0.2"], "weight": 10 },
-    "rxe_lan":    { "neighbors": ["10.2.0.2", "10.2.0.3"], "weight": 100 }
-  },
-  "10.2.0.2": {
-    "usb4_rdma5":  { "neighbors": ["10.2.0.1"], "weight": 10 },
-    "usb4_rdma15": { "neighbors": ["10.2.0.3"], "weight": 10 },
-    "rxe_lan":     { "neighbors": ["10.2.0.1", "10.2.0.3"], "weight": 100 }
-  },
-  "10.2.0.3": {
-    "usb4_rdma15": { "neighbors": ["10.2.0.2"], "weight": 10 },
-    "rxe_lan":     { "neighbors": ["10.2.0.1", "10.2.0.2"], "weight": 100 }
-  }
-}
-```
-
-- **node key** — the OOB IPv4/IPv6 address the node bootstraps on (the same
-  values as `VLLM_RAY_WORKER_IP_ORDER`).
-- **iface key** — the local ibverbs device name (`usb4_rdma5`, `rxe_lan`, …).
-- **neighbors** — node IPs directly reachable on that device.
-- **weight** — edge cost: rails cheap (10), the reaches-all fallback expensive
-  (100).
-
-Per connection, both the connector and the acceptor resolve the peer's OOB IP
-(the connector from the listen handle's `connectAddr`, the acceptor from the
-accepted socket's remote address) and pick the **minimum-weight local
-interface whose `neighbors` contain that IP**. Selection is deliberately
-direct-edge only, never multi-hop: an intermediate chain node does not forward
-RDMA. Semantics:
-
-| Situation | Behaviour |
-| --- | --- |
-| env unset | byte-for-byte the GID-sensing behaviour below |
-| file missing / malformed / local node absent | `WARN` at init + GID-sensing fallback (never a crash or hang) |
-| peer's IP not a declared neighbor of any local iface | `WARN` + keep NCCL's default device / GID-sensing fallback |
-| graph names an iface with no matching local ibverbs device | `WARN` + GID-sensing fallback |
-
-Implemented in `src/transport/net_ib/node_topo.h` (header-only, hand-rolled
-schema parser, no third-party deps), loaded once at plugin init in
-`init.cc`/`connect.cc`; unit-tested hardware-free in
-`rdma-routing/tests/node_topo_test.cc` with the example graph at
-`rdma-routing/tests/fixtures/node_topo_example.json`.
-
-### `NCCL_IB_SUBNET_AWARE_ROUTING` — an expression, not just a flag
-
-Stock 2.30.x treats this as `0`/`1`. This fork extends it: the value can carry an
-HCA **preference**, because the reaches-all fallback (rxe over the LAN) matches
-*every* peer's subnet — so without a preference, an adjacent peer wrongly stays on
-the slow fallback instead of overriding to its fast rail.
-
-| Value | Behaviour |
-| --- | --- |
-| `0` / unset | off |
-| `1` | on, legacy keep-default |
-| `prefer_hca[p1,p2,…]` | on, and when several devices reach a peer, prefer the first whose name matches pattern `p1`, then `p2`, … |
-
-Patterns are POSIX ERE; `\d` (→ `[0-9]`) and a leading `/dev/` are accepted, so
-`prefer_hca[usb4_rdma\d*,rxe_lan\d*]` means **rail for adjacent neighbours, rxe
-only when no rail reaches** (the non-adjacent ring/tree edges). Implemented in
-`ibPreferReachableDev` (`src/transport/net_ib/subnet_match.h`), unit-tested in
-`rdma-routing/tests/subnet_match_test.cc`.
-
-An optional `NCCL_ROUTING_CONF_FILE` provides explicit reachability for topologies
-that subnet-sensing can't express.
-
-## Layout
-
-- `rdma-routing/` — the reachability module (`route.c`) + its test suite.
-- `src/transport/net_ib.cc` — the patched device selection (the one change).
-
-## Relationship to upstream
-
-Tracks `v2.30.7-1`. The intent is a minimal, rebase-friendly diff: one routing
-module plus one call site in net_ib, so the fork stays trivial to carry forward to
-later NCCL releases.
+| Variable | Typical Value | Purpose |
+| :--- | :--- | :--- |
+| `NCCL_IB_HCA` | `usb4_rdma,rxe_lan` | Include both `usb4_rdma*` rails and the `rxe_lan` fallback |
+| `NCCL_IB_ADDR_FAMILY` | `AF_INET6` | Match per-link IPv6 ULA `/64` GIDs |
+| `NCCL_IB_MERGE_NICS` | `0` | Prevent NCCL from merging distinct rails into a single virtual NIC |
+| `NCCL_IB_SUBNET_AWARE_ROUTING` | `prefer_hca[usb4_rdma\d*,rxe_lan\d*]` | Prefer a `/64`-matching `usb4_rdma*` rail; fall back to `rxe_lan` for non-adjacent peers |
+| `NCCL_NODE_TO_NODE_TOPO_FILE` | `/etc/nccl/node-topo.json` | Optional explicit inter-node adjacency graph (takes precedence over GID sensing) |
+| `NCCL_NET_PLUGIN` | `none` | Disable external net plugins (set automatically by `nccl_usb4.activate()`) |

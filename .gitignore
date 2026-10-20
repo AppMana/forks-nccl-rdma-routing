@@ -32,3 +32,6 @@ docs/examples/**/rmsnorm_gin
 docs/examples/**/rmsnorm_hybrid
 docs/examples/**/ring_exchange
 /rdma-routing/build/
+/dist/
+__pycache__/
+.pytest_cache/
