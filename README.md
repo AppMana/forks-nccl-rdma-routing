@@ -35,49 +35,32 @@ capability: **select the local device whose GID `/64` subnet reaches the peer's
 GID**, falling back to the PCI-affinity choice, and then to a reaches-all device
 (e.g. soft-RoCE over the LAN), when no rail matches.
 
-The reachability decision is a small, pure, unit-tested module:
+The reachability decision is a small, pure, unit-tested header suite inside `src/transport/net_ib/`:
 
-- `rdma-routing/src/route.c` — `/64` subnet sensing + an optional explicit
-  reachability config file. Pure logic, no RDMA, device-agnostic.
-- `rdma-routing/tests/route_test.cc` — the contract (two ends of a link share a
-  `/64`; different links differ; a peerless rail is unreachable).
+- `src/transport/net_ib/subnet_match.h` — `/64` subnet sensing, rail vs. fallback classification (`ibRailSelectDev`), multi-GID wire packing (`0xB6`), and generation-scoped sparse GID table caching (`ibGetValidGidSnapshot`).
+- `src/transport/net_ib/node_topo.h` — explicit inter-node topology graph (`NCCL_NODE_TO_NODE_TOPO_FILE`).
+- `ibverbs/tbrxe/tbrxe.c` — userspace `libibverbs` provider (`libtbrxe-rdmav34.so`) binding the `thunderbolt_frame_rxe.ko` private RDMA driver ID (`0x55534234`, `"USB4"`).
+- `rdma-routing/tests/` — unit tests for `subnet_match.h`, `rail_select_test.cc`, and `node_topo.h`.
 
-The net_ib change is just the **call site** that consults it.
+## Install — Single Python Package (`nccl-usb4`)
 
-## Build
+Instead of `.deb` packages, `LD_PRELOAD`, or symlink surgery inside `site-packages/nvidia/nccl/lib/`, install the standalone **`nccl-usb4`** wheel:
 
 ```sh
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86"
-# -> build/lib/libnccl.so.2.30.7
+pip install --extra-index-url https://nodes.appmana.com/simple/ "nccl-usb4==2.30.7"
 ```
 
-Standard NCCL build (see upstream `BUILD.md`). Pick `NVCC_GENCODE` for your GPUs.
+`nccl-usb4` bundles:
+1. `nccl_usb4/nccl/lib/libnccl.so.2` (routed NCCL `2.30.7`)
+2. `nccl_usb4/ibverbs/libtbrxe-rdmav34.so` and `libusb4_rdma-rdmav34.so` (userspace `libibverbs` providers `0.2.73` for `thunderbolt_frame_rxe`)
+3. `nccl_usb4.pth` — runs `nccl_usb4.activate()` at Python startup before `torch` or `vllm` is imported, registering the `tbrxe` provider with `libibverbs.so.1`, placing `nccl_usb4` at `sys.path[0]` so `torch._preload_cuda_deps()` loads `nccl_usb4/nccl/lib/libnccl.so.2` instead of `nvidia-nccl-cu*`, and setting `VLLM_NCCL_SO_PATH` and `NCCL_NET_PLUGIN=none`.
 
-## Install — replacing the NCCL that ships with PyTorch
-
-PyTorch bundles its own NCCL (the `nvidia-nccl-cuXX` wheel, loaded at runtime from
-`<site-packages>/torch/lib/libnccl.so.2`). `torch.cuda.nccl.version()` reports the
-*compiled-against* version regardless of what is actually loaded — **trust the NCCL
-startup banner** (`NCCL version 2.30.7+…`) to confirm which library is live.
-
-### Option A — `LD_PRELOAD` (no rebuild of anything)
+## Build from Source
 
 ```sh
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7 python your_app.py
-```
-
-### Option B — `.deb` that replaces torch's bundled NCCL
-
-`packaging/` builds `libnccl-rdma-routing_2.30.7_amd64.deb`, which:
-
-1. installs `libnccl.so.2.30.7` (+ `libnccl.so.2` symlink) into
-   `/usr/lib/x86_64-linux-gnu/`, and
-2. repoints PyTorch's bundle at it, replacing the wheel's
-   `torch/lib/libnccl.so.2` with a symlink to the system library (the same move
-   the vLLM-Ampere image's `REPLACE_TORCH_BUNDLED_NCCL` step performs).
-
-```sh
-apt-get install -y ./libnccl-rdma-routing_2.30.7_amd64.deb
+make -j src.build NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_100,code=sm_100"
+python3 python/build_wheel.py --nccl-so build/lib/libnccl.so.2.30.7
+# -> dist/nccl_usb4-2.30.7-py3-none-manylinux_2_28_x86_64.whl
 ```
 
 ## Configuration

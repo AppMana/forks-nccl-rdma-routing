@@ -1,0 +1,12 @@
+[project]
+name = "nccl-usb4"
+version = "2.30.7"
+description = "Single-package enabler for routed NCCL 2.30.7 over USB4/Thunderbolt IB RDMA (tbrxe / usb4_rdma)"
+readme = "../README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+keywords = ["nccl", "rdma", "usb4", "thunderbolt", "roce", "pytorch", "vllm"]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
