@@ -139,14 +139,20 @@ def _install_system_ibverbs_files_best_effort() -> None:
 def activate() -> dict[str, Any]:
     """Activate bundled tbrxe libibverbs provider and routed libnccl.so.2."""
     global _ACTIVATED, _LOADED_NCCL_PATH
+    pkg_dir = package_root()
     if _ACTIVATED:
+        if not sys.path or sys.path[0] != pkg_dir:
+            try:
+                sys.path.remove(pkg_dir)
+            except ValueError:
+                pass
+            sys.path.insert(0, pkg_dir)
         return status()
     if os.environ.get("NCCL_USB4_DISABLE", "").strip() in ("1", "true", "TRUE", "yes"):
         return status()
     if sys.platform != "linux" or platform.machine() != "x86_64":
         return status()
 
-    pkg_dir = package_root()
     so_path = nccl_lib_path()
     if not os.path.isfile(so_path):
         return status()
