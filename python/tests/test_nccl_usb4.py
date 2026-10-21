@@ -15,13 +15,15 @@ def test_nccl_usb4_activates_and_exposes_routed_nccl_and_tbrxe() -> None:
     assert info["usb4_rdma_provider_version"] == "0.2.73"
     assert info["nccl_net_plugin"] == "none"
     assert info["tbrxe_loaded"] is True
-    assert any("libtbrxe-rdmav34.so" in p for p in info["ibverbs_providers_loaded"])
+    assert any("libtbrxe-rdmav" in p for p in info["ibverbs_providers_loaded"])
+    assert len(nccl_usb4.ibverbs_provider_paths()) >= 2
     assert not any("libusb4_rdma" in p for p in info["ibverbs_providers_loaded"])
 
     so_path = info["nccl_so_path"]
     with open(so_path, "rb") as f:
         blob = f.read()
     assert b"rail routing:" in blob
+    assert b"skipping external" in blob
 
     lib = ctypes.CDLL(so_path)
     ver = ctypes.c_int()

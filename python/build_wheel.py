@@ -62,9 +62,9 @@ def build_wheel(
     if not nccl_so.is_file():
         raise FileNotFoundError(f"NCCL shared library not found: {nccl_so}")
 
-    provider_path = ibverbs_dir / "libtbrxe-rdmav34.so"
-    if not provider_path.is_file():
-        raise FileNotFoundError(f"tbrxe libibverbs provider not found: {provider_path}")
+    provider_paths = sorted(ibverbs_dir.glob("libtbrxe-rdmav*.so"))
+    if not provider_paths:
+        raise FileNotFoundError(f"No libtbrxe-rdmav*.so providers found in {ibverbs_dir}")
 
     init_py = Path(__file__).resolve().parent / PACKAGE_NAME / "__init__.py"
     if not init_py.is_file():
@@ -91,15 +91,17 @@ def build_wheel(
             _write_member(zf, f"{PACKAGE_NAME}/nccl/lib/libnccl.so.2", nccl_bytes, mode=0o755)
         )
 
-        # 3. Userspace tbrxe libibverbs provider for thunderbolt_frame_rxe
-        records.append(
-            _write_member(
-                zf,
-                f"{PACKAGE_NAME}/ibverbs/libtbrxe-rdmav34.so",
-                provider_path.read_bytes(),
-                mode=0o755,
+        # 3. Userspace tbrxe libibverbs providers for thunderbolt_frame_rxe
+        #    (rdmav59 for NGC rdma-core 63.0, rdmav34 for Ubuntu 24.04 rdma-core 50.0)
+        for provider_path in provider_paths:
+            records.append(
+                _write_member(
+                    zf,
+                    f"{PACKAGE_NAME}/ibverbs/{provider_path.name}",
+                    _strip_shared_library(provider_path),
+                    mode=0o755,
+                )
             )
-        )
         records.append(
             _write_member(
                 zf,
@@ -155,8 +157,12 @@ def main() -> None:
     parser.add_argument(
         "--ibverbs-dir",
         type=Path,
-        default=Path("/usr/lib/x86_64-linux-gnu/libibverbs"),
-        help="Directory containing libtbrxe-rdmav34.so",
+        default=(
+            repo_root / "build-ibverbs"
+            if (repo_root / "build-ibverbs").is_dir()
+            else Path("/usr/lib/x86_64-linux-gnu/libibverbs")
+        ),
+        help="Directory containing libtbrxe-rdmav*.so providers",
     )
     parser.add_argument(
         "--out-dir",

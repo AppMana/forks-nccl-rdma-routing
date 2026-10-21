@@ -14,9 +14,10 @@
 #include <string.h>
 #include <errno.h>
 #include <mutex>
-// #include <sys/types.h>
-// #include <sys/stat.h>
-// #include <unistd.h>
+#if defined(NCCL_OS_LINUX)
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 #if defined(NCCL_OS_LINUX)
 typedef ncclNet_t* getNcclNet_t(void* netPluginLib);
@@ -285,6 +286,57 @@ static void ncclNetPluginRegisterInternal(int* pluginCounter, ncclNet_t* net, in
   (*pluginCounter)++;
 }
 
+#if defined(NCCL_OS_LINUX)
+// External net plugins such as NGC's HPC-X Spectrum-X plugin (libnccl-net-spcx.so,
+// enabled by default via ENV NCCL_NET_PLUGIN=spcx in NGC containers) assume every
+// RDMA device under /sys/class/infiniband/<dev> has a PCI parent (/device symlink)
+// and segfault in nccl_p2p_ib_pci_path on PCI-less soft-RDMA / USB4 HCAs
+// (usb4_rdma*, rxe_lan*). They also bypass internal net_ib rail/fallback routing.
+// Skip external plugins when subnet-aware routing is configured, when any PCI-less
+// IB device is present, or when the Spectrum-X plugin ("spcx") is requested on a
+// host with no mlx5 PCI device.
+static bool ncclShouldSkipExternalNetPlugin(const char* pluginName) {
+  const char* routing = ncclGetEnv("NCCL_IB_SUBNET_AWARE_ROUTING");
+  if (routing && routing[0] != '\0') {
+    INFO(NCCL_INIT | NCCL_NET,
+         "NET/Plugin: skipping external plugin '%s' because NCCL_IB_SUBNET_AWARE_ROUTING is active",
+         pluginName ? pluginName : "");
+    return true;
+  }
+  bool hasPciLessIbDev = false;
+  bool hasMlx5PciDev = false;
+  DIR* dir = opendir("/sys/class/infiniband");
+  if (dir) {
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+      if (entry->d_name[0] == '.') continue;
+      char devPath[PATH_MAX];
+      snprintf(devPath, sizeof(devPath), "/sys/class/infiniband/%s/device", entry->d_name);
+      if (access(devPath, F_OK) != 0) {
+        hasPciLessIbDev = true;
+      } else if (strncmp(entry->d_name, "mlx5_", 5) == 0) {
+        hasMlx5PciDev = true;
+      }
+    }
+    closedir(dir);
+  }
+  if (hasPciLessIbDev) {
+    INFO(NCCL_INIT | NCCL_NET,
+         "NET/Plugin: skipping external plugin '%s' because PCI-less RDMA devices are present; using internal NET/IB",
+         pluginName ? pluginName : "");
+    return true;
+  }
+  if (pluginName && (strcasecmp(pluginName, "spcx") == 0 || strstr(pluginName, "libnccl-net-spcx.so") != nullptr) &&
+      !hasMlx5PciDev) {
+    INFO(NCCL_INIT | NCCL_NET,
+         "NET/Plugin: skipping external Spectrum-X plugin '%s' (no mlx5 HCA present)",
+         pluginName);
+    return true;
+  }
+  return false;
+}
+#endif
+
 static void initPluginLibsOnceFunc() {
   int pluginCounter = 0;
   memset(netPluginLibs, 0, NCCL_NET_MAX_PLUGINS * sizeof(netPluginLib_t));
@@ -302,6 +354,10 @@ static void initPluginLibsOnceFunc() {
     // Iterate over list until the list is empty
     netPluginName = strtok_r(envNetPluginList, ",", &savePtr);
     while (netPluginName) {
+      if (ncclShouldSkipExternalNetPlugin(netPluginName)) {
+        netPluginName = strtok_r(nullptr, ",", &savePtr);
+        continue;
+      }
       // We have 2 internal plugins (ib and socket)
       // So, we can have at most( NCCL_NET_MAX_PLUGINS - (NCCL_NET_NUM_INTERNAL_PLUGINS)) in the NCCL_NET_PLUGIN list
       if (pluginCounter >= (NCCL_NET_MAX_PLUGINS - (NCCL_NET_NUM_INTERNAL_PLUGINS))) {
@@ -323,7 +379,7 @@ static void initPluginLibsOnceFunc() {
       netPluginName = strtok_r(nullptr, ",", &savePtr);
     }
     if (envNetPluginList) free(envNetPluginList);
-  } else {
+  } else if (!ncclShouldSkipExternalNetPlugin(defaultNetPlugin)) {
     // Add default net plugin
     netPluginLibs[pluginCounter].ncclNetPluginState = ncclNetPluginStateLoadReady;
     netPluginLibs[pluginCounter].ncclNetPluginRefCount = ncclParamNetPluginRefCount();

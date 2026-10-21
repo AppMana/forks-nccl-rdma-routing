@@ -55,29 +55,69 @@ def nccl_lib_path() -> str:
 get_nccl_lib_path = nccl_lib_path
 
 
-def tbrxe_provider_path() -> str:
+def tbrxe_provider_path(pabi: int = 59) -> str:
+    candidate = os.path.join(package_root(), "ibverbs", f"libtbrxe-rdmav{pabi}.so")
+    if os.path.isfile(candidate):
+        return candidate
     return os.path.join(package_root(), "ibverbs", "libtbrxe-rdmav34.so")
 
 
 def ibverbs_provider_paths() -> list[str]:
-    path = tbrxe_provider_path()
-    return [path] if os.path.isfile(path) else []
+    ibv_dir = Path(package_root()) / "ibverbs"
+    if not ibv_dir.is_dir():
+        return []
+    return sorted(str(p) for p in ibv_dir.glob("libtbrxe-rdmav*.so") if p.is_file())
+
+
+def _detect_ibverbs_pabi(ibv_lib: ctypes.CDLL) -> int | None:
+    for pabi in (59, 34, 53, 49, 44, 39):
+        if hasattr(ibv_lib, f"verbs_register_driver_{pabi}"):
+            return pabi
+    return None
 
 
 def _install_system_ibverbs_files_best_effort() -> None:
-    """If running with write access in a container, populate /etc/libibverbs.d
-    and /usr/lib/x86_64-linux-gnu/libibverbs so non-Python C tools also see tbrxe."""
-    sys_ibv_dir = Path("/usr/lib/x86_64-linux-gnu/libibverbs")
+    """If running with write access in a container, populate /etc/libibverbs.d,
+    /usr/lib/x86_64-linux-gnu/libibverbs, and /usr/lib/x86_64-linux-gnu/libnccl.so*
+    symlinks so non-Python C tools and ld.so also resolve tbrxe and NCCL 2.32.3."""
+    sys_lib_dir = Path("/usr/lib/x86_64-linux-gnu")
+    sys_ibv_dir = sys_lib_dir / "libibverbs"
     etc_ibv_dir = Path("/etc/libibverbs.d")
     try:
-        src = Path(tbrxe_provider_path())
-        if src.is_file() and sys_ibv_dir.is_dir() and os.access(sys_ibv_dir, os.W_OK):
-            dst = sys_ibv_dir / src.name
-            if not dst.exists():
-                try:
-                    shutil.copy2(src, dst)
-                except OSError:
-                    pass
+        if sys_ibv_dir.is_dir() and os.access(sys_ibv_dir, os.W_OK):
+            for provider_str in ibverbs_provider_paths():
+                src = Path(provider_str)
+                dst = sys_ibv_dir / src.name
+                if not dst.exists():
+                    try:
+                        shutil.copy2(src, dst)
+                    except OSError:
+                        pass
+        if sys_lib_dir.is_dir() and os.access(sys_lib_dir, os.W_OK):
+            so_target = Path(nccl_lib_path())
+            if so_target.is_file():
+                versioned = sys_lib_dir / f"libnccl.so.{__version__}"
+                soname = sys_lib_dir / "libnccl.so.2"
+                bare = sys_lib_dir / "libnccl.so"
+                for old in sys_lib_dir.glob("libnccl.so.2.*"):
+                    if old.name != versioned.name:
+                        try:
+                            old.unlink()
+                        except OSError:
+                            pass
+                for link, target in (
+                    (versioned, str(so_target)),
+                    (soname, versioned.name),
+                    (bare, soname.name),
+                ):
+                    try:
+                        if link.is_symlink() or link.exists():
+                            if link.resolve() == so_target.resolve() and link != versioned:
+                                continue
+                            link.unlink()
+                        link.symlink_to(target)
+                    except OSError:
+                        pass
         if etc_ibv_dir.is_dir() and os.access(etc_ibv_dir, os.W_OK):
             drv_file = etc_ibv_dir / "tbrxe.driver"
             if not drv_file.exists():
@@ -113,11 +153,18 @@ def activate() -> dict[str, Any]:
 
     _install_system_ibverbs_files_best_effort()
 
-    # 1. Preload libibverbs.so.1 and the tbrxe userspace RDMA provider so its
-    #    ELF constructor calls verbs_register_driver_34 in-process.
+    # 1. Preload libibverbs.so.1 and the matching tbrxe userspace RDMA provider
+    #    (rdmav59 on NGC rdma-core 63.0, rdmav34 on Ubuntu 24.04 rdma-core 50.0)
+    #    so its ELF constructor calls verbs_register_driver_<PABI> in-process.
     try:
-        ctypes.CDLL("libibverbs.so.1", mode=ctypes.RTLD_GLOBAL)
-        for provider_path in ibverbs_provider_paths():
+        ibv_lib = ctypes.CDLL("libibverbs.so.1", mode=ctypes.RTLD_GLOBAL)
+        pabi = _detect_ibverbs_pabi(ibv_lib)
+        candidates = (
+            [tbrxe_provider_path(pabi)] if pabi is not None else ibverbs_provider_paths()
+        )
+        for provider_path in candidates:
+            if not os.path.isfile(provider_path):
+                continue
             try:
                 ctypes.CDLL(provider_path, mode=ctypes.RTLD_GLOBAL)
                 if provider_path not in _LOADED_IBVERBS_PROVIDERS:
