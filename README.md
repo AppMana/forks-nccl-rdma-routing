@@ -9,7 +9,7 @@ Fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.32.3-1**) that adds 
 2. **Why routing lives in `net_ib` rather than an external `ncclNet` plugin**:
    NCCL's topology engine (`src/graph/search.cc`) and collective/P2P channel setup choose the `dev` index before calling `ncclNet->connect(dev, ...)` / `listen(dev, ...)`. External `ncclNet` plugins also assume every IB device has a sysfs PCI path and fail on virtual `usb4_rdma*` HCAs.
 3. **Why the userspace `tbrxe` provider is bundled**:
-   On the host kernel (`AppMana/forks-thunderbolt`), `thunderbolt_frame_rxe.ko` implements the standard kernel `rxe` uverbs ABI over lossless USB4 XDomain frames (`thunderbolt_frame.ko`), but registers under private RDMA driver ID `0x55534234` (`"USB4"`) so unloading `rdma_rxe` never tears down USB4 RDMA rails. Because `libibverbs` matches providers by kernel driver ID and stamps that ID into every `uverbs` ioctl header, userspace needs `libtbrxe-rdmav34.so` (`ibverbs/tbrxe/tbrxe.c`), which compiles the `rdma-core` `rxe` provider bound exclusively to driver ID `0x55534234`.
+   On the host kernel (`AppMana/forks-thunderbolt`), `thunderbolt_frame_rxe.ko` implements the standard kernel `rxe` uverbs ABI over lossless USB4 XDomain frames (`thunderbolt_frame.ko`), but registers under private RDMA driver ID `0x55534234` (`"USB4"`) so unloading `rdma_rxe` never tears down USB4 RDMA rails. Because `libibverbs` matches providers by kernel driver ID and stamps that ID into every `uverbs` ioctl header, userspace needs `libtbrxe-rdmav<PABI>.so` (`ibverbs/tbrxe/tbrxe.c`), which compiles the `rdma-core` `rxe` provider bound exclusively to driver ID `0x55534234`.
 
 ## Changes Relative to Upstream `NVIDIA/nccl` (`v2.32.3-1`)
 
@@ -21,6 +21,8 @@ Fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.32.3-1**) that adds 
   - **`NCCL_NODE_TO_NODE_TOPO_FILE`**: Optional JSON topology file mapping `(node_oob_ip, ib_dev) -> {neighbors, weight}` for deterministic minimum-weight direct-edge selection before GID subnet sensing.
 - **`src/graph/search.cc`**:
   - Applies `prefer_hca[...]` priority in `ncclTopoGetNetDev` for P2P channels (`graph == NULL`) so P2P listeners and connectors prefer `usb4_rdma*` rails over `rxe_lan`.
+- **`src/plugin/net.cc`**:
+  - Skips external `ncclNet` plugins (such as NGC's default `NCCL_NET_PLUGIN=spcx`) when `NCCL_IB_SUBNET_AWARE_ROUTING` is set, when PCI-less RDMA devices (`usb4_rdma*`, `rxe_lan*`) exist in `/sys/class/infiniband/`, or when `spcx` is requested without an `mlx5_*` HCA, preventing NULL PCI-path dereferences in external plugins and preserving internal `net_ib` routing.
 - **`ibverbs/tbrxe/`**:
   - Userspace `libibverbs` provider (`tbrxe.c`, `tbrxe.driver`, `CMakeLists.txt`) binding kernel driver ID `0x55534234` (`RDMA_DRIVER_USB4_RDMA`).
 - **`python/` (`nccl-usb4`)**:
@@ -30,7 +32,7 @@ Fork of [NVIDIA/nccl](https://github.com/NVIDIA/nccl) (**v2.32.3-1**) that adds 
 
 ## Single-Package Installation (`nccl-usb4==2.32.3`)
 
-Containers and virtual environments do not need any `.deb` packages beyond standard distro `libibverbs1`:
+Containers and virtual environments do not need any custom `.deb` packages:
 
 ```sh
 pip install --extra-index-url https://nodes.appmana.com/simple/ "nccl-usb4==2.32.3"
@@ -38,11 +40,11 @@ pip install --extra-index-url https://nodes.appmana.com/simple/ "nccl-usb4==2.32
 
 The `nccl-usb4` wheel contains:
 1. `nccl_usb4/nccl/lib/libnccl.so.2` — routed NCCL `2.32.3`
-2. `nccl_usb4/ibverbs/libtbrxe-rdmav34.so` and `nccl_usb4/ibverbs/tbrxe.driver` — userspace `libibverbs` provider (`0.2.73`) for `thunderbolt_frame_rxe`
+2. `nccl_usb4/ibverbs/libtbrxe-rdmav59.so`, `nccl_usb4/ibverbs/libtbrxe-rdmav34.so`, and `nccl_usb4/ibverbs/tbrxe.driver` — userspace `libibverbs` providers (`0.2.73`) for `rdma-core` v63 (`rdmav59`, NGC containers) and v50 (`rdmav34`, Ubuntu 24.04)
 3. `nccl_usb4.pth` — startup hook that invokes `nccl_usb4.activate()` at Python interpreter initialization:
-   - Loads `libibverbs.so.1` and `libtbrxe-rdmav34.so` with `RTLD_GLOBAL` (registering driver ID `0x55534234` via its ELF constructor) and, when `/etc/libibverbs.d` and `/usr/lib/x86_64-linux-gnu/libibverbs` are writable (e.g. in container builds/runtimes), installs `tbrxe.driver`, `libtbrxe-rdmav34.so`, and `/etc/appmana/usb4-rdma-provider-version`.
-   - Places `<site-packages>/nccl_usb4` at `sys.path[0]` and preloads `nccl_usb4/nccl/lib/libnccl.so.2` with `RTLD_GLOBAL`. When `import torch` executes `torch._preload_cuda_deps()`, its `_get_cuda_dep_paths(path, "nccl", "libnccl.so.*[0-9]")` scan matches `sys.path[0]/nccl/lib/libnccl.so.2` first and skips `site-packages/nvidia/nccl/lib/libnccl.so.2`.
-   - Sets `VLLM_NCCL_SO_PATH` (if unset) to the bundled `libnccl.so.2` and `NCCL_NET_PLUGIN=none` (if unset).
+   - Detects the runtime `libibverbs.so.1` provider ABI (`verbs_register_driver_59` or `verbs_register_driver_34`) and preloads the matching `libtbrxe-rdmav<PABI>.so` with `RTLD_GLOBAL`. When `/etc/libibverbs.d` and `/usr/lib/x86_64-linux-gnu` are writable (e.g. during `docker build`), installs `tbrxe.driver`, both `libtbrxe-rdmav*.so` providers, `/etc/appmana/usb4-rdma-provider-version`, and symlinks `/usr/lib/x86_64-linux-gnu/libnccl.so*` to the bundled `libnccl.so.2`.
+   - Places `<site-packages>/nccl_usb4` at `sys.path[0]` and preloads `nccl_usb4/nccl/lib/libnccl.so.2` with `RTLD_GLOBAL` so `torch._preload_cuda_deps()` resolves `nccl_usb4` before `site-packages/nvidia/nccl/lib/libnccl.so.2`.
+   - Sets `VLLM_NCCL_SO_PATH` (if unset) to the bundled `libnccl.so.2`.
 
 ## Building and Testing
 
